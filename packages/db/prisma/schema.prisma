@@ -1,0 +1,331 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TaskSourceType {
+  github_issue
+  github_pr_comment
+  ci_failure
+  manual
+  incident
+}
+
+enum RiskLevel {
+  low
+  medium
+  high
+  critical
+}
+
+enum FilesystemMode {
+  read_only
+  workspace_write
+  full_access
+}
+
+enum NetworkMode {
+  disabled
+  allowlist
+  unrestricted
+}
+
+enum SecretsMode {
+  none
+  setup_only
+  task_scoped
+}
+
+enum RunStatus {
+  queued
+  policy_blocked
+  preparing
+  running
+  waiting_approval
+  verifying
+  reviewing
+  repairing
+  completed
+  failed
+  cancelled
+  stopped
+}
+
+enum ReviewVerdict {
+  approved
+  requires_changes
+  requires_human_review
+  blocked
+}
+
+enum EvidenceStatus {
+  draft
+  complete
+  archived
+}
+
+enum ApprovalAction {
+  approved
+  rejected
+}
+
+model Repository {
+  id              String   @id @default(cuid())
+  platform        String   @default("github")
+  owner           String
+  name            String
+  fullName        String   @unique
+  url             String
+  defaultBranch   String   @default("main")
+  localPath       String?  @map("local_path")
+
+  languages       String[]
+  packageManager  String?
+  testCommand     String?
+  lintCommand     String?
+  typecheckCommand String?
+  buildCommand    String?
+  codeownersPath  String?
+  highRiskPaths   String[]
+
+  hasAgentsMd     Boolean  @default(false)
+  hasClaudeMd     Boolean  @default(false)
+  hasAiCicdDir    Boolean  @default(false)
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tasks           AgentTask[]
+  policies        RepoPolicy[]
+  scanResults     RepoScanResult[]
+
+  @@index([fullName])
+  @@map("repositories")
+}
+
+model RepoScanResult {
+  id           String    @id @default(cuid())
+  repoId       String    @map("repo_id")
+  scanType     String
+  result       Json
+  createdAt    DateTime  @default(now())
+
+  repo         Repository @relation(fields: [repoId], references: [id], onDelete: Cascade)
+
+  @@index([repoId])
+  @@map("repo_scan_results")
+}
+
+model RepoPolicy {
+  id           String    @id @default(cuid())
+  repoId       String    @map("repo_id")
+  layer        String
+  path         String?
+  priority     Int       @default(0)
+  policy       Json
+  sourceFile   String?
+  active       Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  repo         Repository @relation(fields: [repoId], references: [id], onDelete: Cascade)
+
+  @@unique([repoId, layer, path])
+  @@index([repoId, layer])
+  @@map("repo_policies")
+}
+
+model AgentTask {
+  id                String           @id @default(cuid())
+  repoId            String           @map("repo_id")
+
+  sourceType        TaskSourceType   @map("source_type")
+  sourceUrl         String?          @map("source_url")
+  sourcePayload     Json?            @map("source_payload")
+
+  goal              String
+  scope             Json
+  constraints       String[]
+  doneWhen          String[]         @map("done_when")
+
+  riskLevel         RiskLevel        @map("risk_level")
+  riskReasons       String[]         @map("risk_reasons")
+
+  filesystemMode    FilesystemMode   @default(workspace_write) @map("filesystem_mode")
+  allowedPaths      String[]         @default([]) @map("allowed_paths")
+  forbiddenPaths    String[]         @default([]) @map("forbidden_paths")
+  allowedCommands   String[]         @default([]) @map("allowed_commands")
+  deniedCommands    String[]         @default([]) @map("denied_commands")
+  networkMode       NetworkMode      @default(disabled) @map("network_mode")
+  networkDomains    String[]         @default([]) @map("network_domains")
+  secretsMode       SecretsMode      @default(none) @map("secrets_mode")
+
+  maxRepairLoops    Int              @default(2) @map("max_repair_loops")
+  allowTestUpdate   Boolean          @default(true) @map("allow_test_update")
+  forbidTestDeletion Boolean         @default(true) @map("forbid_test_deletion")
+  forbidPolicyWeakening Boolean      @default(true) @map("forbid_policy_weakening")
+
+  autoApprove       Boolean          @default(false) @map("auto_approve")
+  requiresHumanApproval Boolean      @default(false) @map("requires_human_approval")
+  humanApprovalPaths String[]        @default([]) @map("human_approval_paths")
+
+  preferredAgent    String?          @map("preferred_agent")
+  fallbackAgent     String?          @map("fallback_agent")
+
+  status            String           @default("pending")
+  createdBy         String?          @map("created_by")
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  repo              Repository       @relation(fields: [repoId], references: [id])
+  runs              AgentRun[]
+  approvals         TaskApproval[]
+  evidences         Evidence[]
+
+  @@index([repoId, status])
+  @@index([status])
+  @@map("agent_tasks")
+}
+
+model TaskApproval {
+  id          String         @id @default(cuid())
+  taskId      String         @map("task_id")
+  action      ApprovalAction
+  approver    String
+  reason      String?
+  createdAt   DateTime       @default(now())
+
+  task        AgentTask      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+  @@map("task_approvals")
+}
+
+model AgentRun {
+  id              String     @id @default(cuid())
+  taskId          String     @map("task_id")
+
+  agentName       String     @map("agent_name")
+  executionMode   String     @map("execution_mode")
+
+  status          RunStatus  @default(queued)
+
+  branch          String?
+  commitSha       String?    @map("commit_sha")
+  pullRequestUrl  String?    @map("pull_request_url")
+
+  startedAt       DateTime?  @map("started_at")
+  finishedAt      DateTime?  @map("finished_at")
+
+  filesChanged    String[]   @default([]) @map("files_changed")
+  commandsRun     String[]   @default([]) @map("commands_run")
+  networkUsed     Boolean    @default(false) @map("network_used")
+  secretsAccessed  Boolean   @default(false) @map("secrets_accessed")
+
+  diffSummary     Json?      @map("diff_summary")
+  diffFull        String?    @map("diff_full")
+
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  task            AgentTask  @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  events          AgentEventRecord[]
+  repairs         RepairLoopRecord[]
+  reviews         ReviewResultRecord[]
+
+  @@index([taskId])
+  @@index([status])
+  @@index([agentName])
+  @@map("agent_runs")
+}
+
+model AgentEventRecord {
+  id        String   @id @default(cuid())
+  runId     String   @map("run_id")
+  type      String
+  data      Json
+  timestamp DateTime @default(now())
+
+  run       AgentRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId, timestamp])
+  @@map("agent_events")
+}
+
+model RepairLoopRecord {
+  id                  String   @id @default(cuid())
+  runId               String   @map("run_id")
+  loopNumber          Int      @map("loop_number")
+
+  failureType         String   @map("failure_type")
+  ciJob               String?  @map("ci_job")
+  logExcerptRef       String?  @map("log_excerpt_ref")
+
+  hypothesis          String?
+  filesChanged        String[] @default([]) @map("files_changed")
+  testsAdded          String[] @default([]) @map("tests_added")
+
+  verificationResult  String?  @map("verification_result")
+  escalationReason    String?  @map("escalation_reason")
+
+  createdAt           DateTime @default(now())
+
+  run                 AgentRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+  @@map("repair_loops")
+}
+
+model ReviewResultRecord {
+  id            String         @id @default(cuid())
+  runId         String         @map("run_id")
+  agentName     String         @map("agent_name")
+
+  summary       String
+  findings      Json           @default("[]")
+  verdict       ReviewVerdict
+
+  reviewedAt    DateTime       @default(now())
+
+  run           AgentRun       @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+  @@map("review_results")
+}
+
+model Evidence {
+  id                  String         @id @default(cuid())
+  taskId              String         @map("task_id")
+  runId               String?        @map("run_id")
+
+  schemaVersion       String         @default("1.0") @map("schema_version")
+  status              EvidenceStatus @default(draft)
+
+  repo                String
+  sourceSha           String?        @map("source_sha")
+  targetBranch        String?        @map("target_branch")
+
+  agentSection        Json?          @map("agent_section")
+  policySection       Json?          @map("policy_section")
+  contextSection      Json?          @map("context_section")
+  executionSection    Json?          @map("execution_section")
+  verificationSection Json?          @map("verification_section")
+  reviewSection       Json?          @map("review_section")
+  repairSection       Json?          @map("repair_section")
+  residualRiskSection Json?          @map("residual_risk_section")
+
+  fullEvidence        Json?          @map("full_evidence")
+
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  task                AgentTask      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId])
+  @@index([runId])
+  @@map("evidences")
+}

@@ -1,0 +1,39 @@
+{
+  "name": "aicp",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently \"API_PORT=3101 pnpm --filter @aicp/api dev\" \"NEXT_PUBLIC_API_URL=http://127.0.0.1:3101 pnpm --filter @aicp/dashboard dev\"",
+    "dev:api": "API_PORT=3101 pnpm --filter @aicp/api dev",
+    "dev:dashboard": "NEXT_PUBLIC_API_URL=http://127.0.0.1:3101 pnpm --filter @aicp/dashboard dev",
+    "build": "pnpm --filter @aicp/shared build && pnpm --filter @aicp/db generate && pnpm --filter @aicp/api build && pnpm --filter @aicp/dashboard build",
+    "build:api": "pnpm --filter @aicp/api build",
+    "build:dashboard": "pnpm --filter @aicp/dashboard build",
+    "test": "pnpm --filter @aicp/api test",
+    "test:e2e": "pnpm --filter @aicp/api test:e2e",
+    "test:e2e:live": "bash ./scripts/test-e2e-live.sh",
+    "db:migrate": "pnpm --filter @aicp/db migrate",
+    "db:generate": "pnpm --filter @aicp/db generate",
+    "db:seed": "pnpm --filter @aicp/db seed",
+    "db:reset": "pnpm --filter @aicp/db reset",
+    "lint": "pnpm -r lint",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@prisma/client",
+      "@prisma/engines",
+      "prisma",
+      "esbuild",
+      "sharp",
+      "unrs-resolver"
+    ]
+  }
+}

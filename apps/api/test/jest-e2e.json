@@ -1,0 +1,15 @@
+{
+  "moduleFileExtensions": ["js", "json", "ts"],
+  "rootDir": ".",
+  "testRegex": "test/.*\\.e2e-spec\\.ts$",
+  "transform": {
+    "^.+\\.(t|j)s$": "ts-jest"
+  },
+  "testEnvironment": "node",
+  "moduleNameMapper": {
+    "^@aicp/shared$": "<rootDir>/../../../packages/shared/src/index.ts",
+    "^@aicp/shared/(.*)$": "<rootDir>/../../../packages/shared/src/$1",
+    "^(\\.{1,2}/.*)\\.js$": "$1",
+    "^@/(.*)$": "<rootDir>/../src/$1"
+  }
+}
