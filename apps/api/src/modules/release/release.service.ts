@@ -1,6 +1,9 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaClient, type RunStatus } from '@prisma/client';
+import type { ActionActor } from '../access/action-actor.js';
+import { WorkflowGeneratorService } from '../repo/workflow-generator.service.js';
 import { ReviewGateService } from '../review/review-gate.service.js';
+import { ConfigService } from '../../config/configuration.js';
 
 const prisma = new PrismaClient();
 
@@ -18,6 +21,14 @@ type ReleasePlan = {
   headBranch: string | null;
   compareUrl: string | null;
   brokeredContext: BrokeredContextData | null;
+  deliveryActions: Array<Record<string, unknown>>;
+  githubDispatch: {
+    ready: boolean;
+    workflow: string;
+    workflowPath: string;
+    actionsUrl: string | null;
+    dispatchUrl: string | null;
+  };
   releaseNotes: string;
   rollbackPlan: string[];
   deploymentRecommendation: 'ready' | 'blocked';
@@ -47,7 +58,13 @@ type ScanFindingSummary = {
 
 @Injectable()
 export class ReleaseService {
-  constructor(private readonly reviewGateService: ReviewGateService) {}
+  private readonly releaseWorkflow = 'ai-release.yml';
+
+  constructor(
+    private readonly reviewGateService: ReviewGateService,
+    private readonly config: ConfigService,
+    private readonly workflowGenerator: WorkflowGeneratorService,
+  ) {}
 
   async evaluateGate(taskId: string): Promise<{
     canRelease: boolean;
@@ -91,6 +108,13 @@ export class ReleaseService {
     const reviewGate = latestRun
       ? await this.reviewGateService.evaluate(taskId, latestRun.id)
       : { canMerge: false, blockers: ['No run available for release evaluation'], warnings: [] };
+    const githubRepoConnected = Boolean(task.repo?.fullName) && Boolean(task.repo?.url);
+    const repoWorkflowDefinitions = task.repo
+      ? await this.workflowGenerator.inspectWorkflowDefinitions(task.repo.localPath)
+      : [];
+    const releaseWorkflowDefinition = repoWorkflowDefinitions.find(
+      (workflow) => workflow.filename === this.releaseWorkflow,
+    );
 
     const blockers = [...reviewGate.blockers];
     const warnings = [...reviewGate.warnings];
@@ -279,6 +303,50 @@ export class ReleaseService {
       blockers.push('Rollback plan requires at least one run');
     }
 
+    checks['github_repo_connected'] = {
+      passed: githubRepoConnected,
+      required: true,
+      detail: githubRepoConnected
+        ? `GitHub repository is connected as ${task.repo?.fullName}.`
+        : 'Task repository is not configured for GitHub release dispatch.',
+    };
+    if (!githubRepoConnected) {
+      blockers.push('GitHub repository connection is required for release dispatch');
+    }
+
+    checks['github_release_workflow_declared'] = {
+      passed: true,
+      required: true,
+      detail: `Release dispatch targets .github/workflows/${this.releaseWorkflow}.`,
+    };
+
+    const workflowInstallationStatus = releaseWorkflowDefinition?.installation.status ?? 'unknown';
+    checks['github_release_workflow_installed'] = {
+      passed: workflowInstallationStatus === 'installed',
+      required: true,
+      detail:
+        releaseWorkflowDefinition?.installation.detail ??
+        'Release workflow installation could not be verified.',
+    };
+    if (workflowInstallationStatus === 'missing') {
+      blockers.push(`Release workflow ${this.releaseWorkflow} is missing from the connected checkout`);
+    } else if (workflowInstallationStatus === 'drifted') {
+      blockers.push(`Release workflow ${this.releaseWorkflow} has drifted from the generated template`);
+    } else if (workflowInstallationStatus === 'unknown') {
+      warnings.push(`Release workflow ${this.releaseWorkflow} could not be locally verified.`);
+    }
+
+    checks['github_token_configured'] = {
+      passed: Boolean(this.config.githubToken),
+      required: true,
+      detail: this.config.githubToken
+        ? 'GITHUB_TOKEN is configured for release dispatch.'
+        : 'GITHUB_TOKEN is not configured for release dispatch.',
+    };
+    if (!this.config.githubToken) {
+      blockers.push('GitHub token is required for release dispatch');
+    }
+
     return {
       canRelease: blockers.length === 0,
       checks,
@@ -321,10 +389,17 @@ export class ReleaseService {
     const brokeredContext = latestRun ? this.getBrokeredContext(latestRun.events ?? []) : null;
     const effectiveRiskLevel = brokeredContext?.riskLevel ?? task.riskLevel;
     const latestVerification = latestRun ? this.getLatestEventData(latestRun.events ?? [], 'verification_completed') : null;
+    const deliveryActions = latestRun ? this.getDeliveryActions(latestRun.events ?? []) : [];
     const compareUrl =
       task.repo?.url && baseBranch && headBranch
         ? `${task.repo.url.replace(/\/$/, '')}/compare/${encodeURIComponent(baseBranch)}...${encodeURIComponent(headBranch)}?expand=1`
         : null;
+    const actionsUrl = task.repo?.fullName
+      ? `https://github.com/${task.repo.fullName}/actions/workflows/${this.releaseWorkflow}`
+      : null;
+    const dispatchUrl = task.repo?.fullName
+      ? `${this.config.githubApiUrl}/repos/${task.repo.fullName}/actions/workflows/${this.releaseWorkflow}/dispatches`
+      : null;
 
     return {
       taskId,
@@ -334,6 +409,14 @@ export class ReleaseService {
       headBranch,
       compareUrl,
       brokeredContext,
+      deliveryActions,
+      githubDispatch: {
+        ready: gate.canRelease,
+        workflow: this.releaseWorkflow,
+        workflowPath: `.github/workflows/${this.releaseWorkflow}`,
+        actionsUrl,
+        dispatchUrl,
+      },
       releaseNotes: this.composeReleaseNotes({
         goal: task.goal,
         riskLevel: effectiveRiskLevel,
@@ -360,6 +443,208 @@ export class ReleaseService {
     return { notes: plan.releaseNotes };
   }
 
+  async dispatchGithubRelease(taskId: string, actor?: ActionActor): Promise<Record<string, unknown>> {
+    const [gate, plan] = await Promise.all([
+      this.evaluateGate(taskId),
+      this.generateReleasePlan(taskId),
+    ]);
+
+    if (!plan.repo) {
+      throw new NotFoundException(`Repository not found for task: ${taskId}`);
+    }
+    if (!gate.canRelease) {
+      throw new BadRequestException(
+        `Release gate is blocked: ${gate.blockers.join('; ') || 'unknown blockers'}`,
+      );
+    }
+    if (!this.config.githubToken) {
+      throw new BadRequestException('GITHUB_TOKEN is not configured.');
+    }
+
+    const ref = plan.baseBranch ?? 'main';
+    const response = await fetch(
+      `${this.config.githubApiUrl}/repos/${plan.repo}/actions/workflows/${this.releaseWorkflow}/dispatches`,
+      {
+        method: 'POST',
+        headers: this.getGithubHeaders(),
+        body: JSON.stringify({
+          ref,
+          inputs: {
+            task_id: taskId,
+          },
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      throw new BadRequestException(await this.readGithubError(response));
+    }
+
+    if (gate.latestRunId) {
+      await prisma.agentEventRecord.create({
+        data: {
+          runId: gate.latestRunId,
+          type: 'github_release_dispatched',
+          data: {
+            workflow: this.releaseWorkflow,
+            workflowPath: `.github/workflows/${this.releaseWorkflow}`,
+            taskId,
+            repo: plan.repo,
+            ref,
+            actionsUrl: `https://github.com/${plan.repo}/actions/workflows/${this.releaseWorkflow}`,
+            actor,
+          } as any,
+        },
+      });
+    }
+
+    return {
+      taskId,
+      dispatched: true,
+      workflow: this.releaseWorkflow,
+      workflowPath: `.github/workflows/${this.releaseWorkflow}`,
+      repo: plan.repo,
+      ref,
+      actionsUrl: `https://github.com/${plan.repo}/actions/workflows/${this.releaseWorkflow}`,
+      actor: actor ?? null,
+    };
+  }
+
+  async syncGithubReleaseStatus(taskId: string, actor?: ActionActor): Promise<Record<string, unknown>> {
+    const task = await prisma.agentTask.findUnique({
+      where: { id: taskId },
+      include: {
+        repo: true,
+        runs: {
+          orderBy: { createdAt: 'desc' },
+          include: {
+            events: {
+              orderBy: { timestamp: 'asc' },
+            },
+          },
+        },
+      },
+    });
+
+    if (!task) {
+      throw new NotFoundException(`Task not found: ${taskId}`);
+    }
+    if (!task.repo?.fullName) {
+      throw new NotFoundException(`Repository not found for task: ${taskId}`);
+    }
+    if (!this.config.githubToken) {
+      throw new BadRequestException('GITHUB_TOKEN is not configured.');
+    }
+
+    const latestRun = task.runs[0] ?? null;
+    if (!latestRun) {
+      throw new BadRequestException('No run is available for release status sync.');
+    }
+
+    const dispatchedEvent = [...latestRun.events]
+      .reverse()
+      .find((event) => event.type === 'github_release_dispatched');
+    if (!dispatchedEvent) {
+      throw new BadRequestException('No GitHub release dispatch record was found for this task.');
+    }
+
+    const dispatchedData =
+      dispatchedEvent.data && typeof dispatchedEvent.data === 'object'
+        ? (dispatchedEvent.data as Record<string, unknown>)
+        : {};
+    const workflow =
+      typeof dispatchedData.workflow === 'string' ? dispatchedData.workflow : this.releaseWorkflow;
+    const ref =
+      typeof dispatchedData.ref === 'string'
+        ? dispatchedData.ref
+        : latestRun.branch ?? task.repo.defaultBranch ?? 'main';
+
+    const response = await fetch(
+      `${this.config.githubApiUrl}/repos/${task.repo.fullName}/actions/workflows/${workflow}/runs?event=workflow_dispatch&branch=${encodeURIComponent(ref)}&per_page=20`,
+      {
+        method: 'GET',
+        headers: this.getGithubHeaders(),
+      },
+    );
+
+    if (!response.ok) {
+      throw new BadRequestException(await this.readGithubError(response));
+    }
+
+    const payload = (await response.json()) as {
+      workflow_runs?: Array<Record<string, unknown>>;
+    };
+    const workflowRuns = Array.isArray(payload.workflow_runs) ? payload.workflow_runs : [];
+    const dispatchedAt = new Date(dispatchedEvent.timestamp).getTime();
+    const matchedRun =
+      workflowRuns.find((run) => {
+        const createdAt = typeof run.created_at === 'string' ? new Date(run.created_at).getTime() : 0;
+        const headBranch = typeof run.head_branch === 'string' ? run.head_branch : null;
+        return headBranch === ref && createdAt >= dispatchedAt - 5 * 60 * 1000;
+      }) ?? null;
+
+    if (!matchedRun) {
+      return {
+        taskId,
+        synced: false,
+        found: false,
+        workflow,
+        repo: task.repo.fullName,
+        ref,
+        actionsUrl:
+          typeof dispatchedData.actionsUrl === 'string'
+            ? dispatchedData.actionsUrl
+            : `https://github.com/${task.repo.fullName}/actions/workflows/${workflow}`,
+      };
+    }
+
+    const syncData = {
+      workflow,
+      taskId,
+      repo: task.repo.fullName,
+      ref,
+      workflowRunId: typeof matchedRun.id === 'number' ? matchedRun.id : null,
+      runNumber: typeof matchedRun.run_number === 'number' ? matchedRun.run_number : null,
+      status: typeof matchedRun.status === 'string' ? matchedRun.status : 'unknown',
+      conclusion: typeof matchedRun.conclusion === 'string' ? matchedRun.conclusion : null,
+      htmlUrl: typeof matchedRun.html_url === 'string' ? matchedRun.html_url : null,
+      createdAt: typeof matchedRun.created_at === 'string' ? matchedRun.created_at : null,
+      updatedAt: typeof matchedRun.updated_at === 'string' ? matchedRun.updated_at : null,
+      actor: actor ?? null,
+    };
+
+    const latestStatusEvent = [...latestRun.events]
+      .reverse()
+      .find((event) => event.type === 'github_release_status_synced');
+    const latestStatusData =
+      latestStatusEvent?.data && typeof latestStatusEvent.data === 'object'
+        ? (latestStatusEvent.data as Record<string, unknown>)
+        : null;
+    const unchanged =
+      latestStatusData &&
+      latestStatusData.workflowRunId === syncData.workflowRunId &&
+      latestStatusData.status === syncData.status &&
+      latestStatusData.conclusion === syncData.conclusion &&
+      latestStatusData.htmlUrl === syncData.htmlUrl;
+
+    if (!unchanged) {
+      await prisma.agentEventRecord.create({
+        data: {
+          runId: latestRun.id,
+          type: 'github_release_status_synced',
+          data: syncData as any,
+        },
+      });
+    }
+
+    return {
+      synced: true,
+      found: true,
+      unchanged: Boolean(unchanged),
+      ...syncData,
+    };
+  }
+
   private getLatestEventData(
     events: Array<{ type: string; data: unknown }>,
     type: string,
@@ -375,6 +660,45 @@ export class ReleaseService {
     return match && match.data && typeof match.data === 'object'
       ? (match.data as BrokeredContextData)
       : null;
+  }
+
+  private getDeliveryActions(events: Array<{ type: string; data: unknown }>): Array<Record<string, unknown>> {
+    return events
+      .filter((event) =>
+        [
+          'github_pull_request_created',
+          'github_review_submitted',
+          'github_release_dispatched',
+          'github_release_status_synced',
+        ].includes(
+          event.type,
+        ),
+      )
+      .map((event) => {
+        const data = event.data && typeof event.data === 'object' ? (event.data as Record<string, unknown>) : {};
+        return {
+          type: event.type,
+          actor: data.actor && typeof data.actor === 'object' ? data.actor : null,
+          timestamp:
+            data.timestamp ??
+            (typeof (event as { timestamp?: unknown }).timestamp === 'string'
+              ? (event as { timestamp?: string }).timestamp
+              : null),
+          status: typeof data.status === 'string' ? data.status : null,
+          conclusion: typeof data.conclusion === 'string' ? data.conclusion : null,
+          workflowRunId: typeof data.workflowRunId === 'number' ? data.workflowRunId : null,
+          targetUrl:
+            typeof data.pullRequestUrl === 'string'
+              ? data.pullRequestUrl
+              : typeof data.reviewUrl === 'string'
+                ? data.reviewUrl
+                : typeof data.htmlUrl === 'string'
+                  ? data.htmlUrl
+                : typeof data.actionsUrl === 'string'
+                  ? data.actionsUrl
+                  : null,
+        };
+      });
   }
 
   private getVerificationCheckStatus(
@@ -530,5 +854,28 @@ export class ReleaseService {
 
   private unique(values: string[]): string[] {
     return [...new Set(values)];
+  }
+
+  private getGithubHeaders() {
+    return {
+      Authorization: `Bearer ${this.config.githubToken}`,
+      Accept: 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+      'User-Agent': 'aicp-control-plane',
+      'X-GitHub-Api-Version': '2022-11-28',
+    };
+  }
+
+  private async readGithubError(response: Response) {
+    try {
+      const payload = (await response.json()) as { message?: string };
+      if (payload?.message) {
+        return `GitHub API error: ${payload.message}`;
+      }
+    } catch {
+      return `GitHub API error: ${response.status} ${response.statusText}`;
+    }
+
+    return `GitHub API error: ${response.status} ${response.statusText}`;
   }
 }

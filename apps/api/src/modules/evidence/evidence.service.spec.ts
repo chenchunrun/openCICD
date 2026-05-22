@@ -37,6 +37,27 @@ describe('EvidenceService', () => {
             license_scan: [{ type: 'restricted_license', match: 'BUSL-1.1' }],
           },
         },
+        executionSection: {
+          preparationMode: 'synthetic_git',
+          deliveryActions: [
+            {
+              type: 'task_approved',
+              timestamp: '2026-05-21T00:03:00.000Z',
+              actor: { role: 'releaser', name: 'release-manager', source: 'dashboard' },
+            },
+            {
+              type: 'run_stopped',
+              timestamp: '2026-05-21T00:02:00.000Z',
+              actor: { role: 'operator', name: 'ops-console', source: 'dashboard' },
+            },
+            {
+              type: 'github_pull_request_created',
+              timestamp: '2026-05-21T00:04:00.000Z',
+              actor: { role: 'operator', name: 'release-bot', source: 'dashboard' },
+              targetUrl: 'https://github.com/acme/service/pull/1',
+            },
+          ],
+        },
         reviewSection: {
           humanReview: 'required',
           codeOwnerApproval: 'pending',
@@ -71,10 +92,36 @@ describe('EvidenceService', () => {
         secret_scan: 1,
         license_scan: 1,
       },
+      deliveryActionTotals: {
+        task_approved: 1,
+        run_stopped: 1,
+        github_pull_request_created: 1,
+      },
+      preparationModeTotals: {
+        synthetic_git: 1,
+      },
+      governanceActionTotals: {
+        approved: 1,
+        stopped: 1,
+      },
     });
     expect(result.items[0]).toEqual(
       expect.objectContaining({
         evidenceId: 'evidence-1',
+        execution: expect.objectContaining({
+          preparationMode: 'synthetic_git',
+          deliveryActions: [
+            expect.objectContaining({
+              type: 'task_approved',
+            }),
+            expect.objectContaining({
+              type: 'run_stopped',
+            }),
+            expect.objectContaining({
+              type: 'github_pull_request_created',
+            }),
+          ],
+        }),
         verification: {
           checks: {
             lint: 'passed',
@@ -87,6 +134,21 @@ describe('EvidenceService', () => {
         },
       }),
     );
+    expect(result.activity).toEqual([
+      expect.objectContaining({
+        type: 'github_pull_request_created',
+        timestamp: '2026-05-21T00:04:00.000Z',
+        targetUrl: 'https://github.com/acme/service/pull/1',
+      }),
+      expect.objectContaining({
+        type: 'task_approved',
+        timestamp: '2026-05-21T00:03:00.000Z',
+      }),
+      expect.objectContaining({
+        type: 'run_stopped',
+        timestamp: '2026-05-21T00:02:00.000Z',
+      }),
+    ]);
   });
 
   it('can export only evidence records that contain scan findings', async () => {
@@ -105,6 +167,7 @@ describe('EvidenceService', () => {
             secret_scan: [{ type: 'github_token', match: 'ghp_example' }],
           },
         },
+        executionSection: {},
         reviewSection: {},
         repairSection: {},
         residualRiskSection: {},
@@ -127,6 +190,7 @@ describe('EvidenceService', () => {
             license_scan: [],
           },
         },
+        executionSection: {},
         reviewSection: {},
         repairSection: {},
         residualRiskSection: {},
@@ -152,6 +216,7 @@ describe('EvidenceService', () => {
         status: 'complete',
         createdAt: new Date('2026-05-21T00:00:00.000Z'),
         verificationSection: {},
+        executionSection: {},
         reviewSection: {
           humanReview: 'required',
           codeOwnerApproval: 'pending',
@@ -169,6 +234,7 @@ describe('EvidenceService', () => {
         status: 'complete',
         createdAt: new Date('2026-05-21T01:00:00.000Z'),
         verificationSection: {},
+        executionSection: {},
         reviewSection: {
           humanReview: 'waived',
           codeOwnerApproval: 'approved',
@@ -203,6 +269,7 @@ describe('EvidenceService', () => {
             license_scan: [],
           },
         },
+        executionSection: {},
         reviewSection: {},
         repairSection: {},
         residualRiskSection: {},
@@ -222,6 +289,7 @@ describe('EvidenceService', () => {
             license_scan: [{ type: 'restricted_license', match: 'BUSL-1.1' }],
           },
         },
+        executionSection: {},
         reviewSection: {},
         repairSection: {},
         residualRiskSection: {},
@@ -237,5 +305,66 @@ describe('EvidenceService', () => {
     });
     expect(result.items).toHaveLength(1);
     expect(result.items[0]?.evidenceId).toBe('evidence-2');
+  });
+
+  it('can export only evidence records that match requested action types', async () => {
+    mockPrisma.evidence.findMany.mockResolvedValue([
+      {
+        id: 'evidence-1',
+        taskId: 'task-1',
+        runId: 'run-1',
+        repo: 'acme/service',
+        schemaVersion: '1.0',
+        status: 'complete',
+        createdAt: new Date('2026-05-21T00:00:00.000Z'),
+        verificationSection: {},
+        executionSection: {
+          deliveryActions: [
+            {
+              type: 'task_approved',
+              timestamp: '2026-05-21T00:01:00.000Z',
+            },
+          ],
+        },
+        reviewSection: {},
+        repairSection: {},
+        residualRiskSection: {},
+        contextSection: {},
+      },
+      {
+        id: 'evidence-2',
+        taskId: 'task-2',
+        runId: 'run-2',
+        repo: 'acme/service',
+        schemaVersion: '1.0',
+        status: 'complete',
+        createdAt: new Date('2026-05-21T01:00:00.000Z'),
+        verificationSection: {},
+        executionSection: {
+          deliveryActions: [
+            {
+              type: 'github_review_submitted',
+              timestamp: '2026-05-21T01:01:00.000Z',
+            },
+          ],
+        },
+        reviewSection: {},
+        repairSection: {},
+        residualRiskSection: {},
+        contextSection: {},
+      },
+    ]);
+
+    const result = await service.exportBundle({ actionTypes: ['github_review_submitted'] });
+
+    expect(result.summary.evidenceCount).toBe(1);
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]?.evidenceId).toBe('evidence-2');
+    expect(result.activity).toEqual([
+      expect.objectContaining({
+        type: 'github_review_submitted',
+        timestamp: '2026-05-21T01:01:00.000Z',
+      }),
+    ]);
   });
 });

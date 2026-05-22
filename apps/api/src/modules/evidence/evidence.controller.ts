@@ -12,6 +12,16 @@ export class EvidenceController {
     'license_scan',
   ]);
 
+  private readonly supportedActionTypes = new Set([
+    'task_approved',
+    'task_rejected',
+    'run_stopped',
+    'github_pull_request_created',
+    'github_review_submitted',
+    'github_release_dispatched',
+    'github_release_status_synced',
+  ]);
+
   private normalizeQueryList(value?: string | string[]): string[] | undefined {
     if (Array.isArray(value)) {
       return value.flatMap((entry) => entry.split(',')).map((entry) => entry.trim()).filter(Boolean);
@@ -29,6 +39,16 @@ export class EvidenceController {
     }
 
     const normalized = entries.filter((entry) => this.supportedScanTypes.has(entry));
+    return normalized.length > 0 ? normalized : undefined;
+  }
+
+  private normalizeActionTypes(value?: string | string[]): string[] | undefined {
+    const entries = this.normalizeQueryList(value);
+    if (!entries?.length) {
+      return undefined;
+    }
+
+    const normalized = entries.filter((entry) => this.supportedActionTypes.has(entry));
     return normalized.length > 0 ? normalized : undefined;
   }
 
@@ -58,13 +78,15 @@ export class EvidenceController {
       taskIds?: string[];
       runIds?: string[];
       scanFindingsOnly?: boolean;
-      approvalPendingOnly?: boolean;
-      scanTypes?: string[];
+        approvalPendingOnly?: boolean;
+        scanTypes?: string[];
+        actionTypes?: string[];
     },
   ) {
     return this.evidenceService.exportBundle({
       ...body,
       scanTypes: this.normalizeScanTypes(body.scanTypes),
+      actionTypes: this.normalizeActionTypes(body.actionTypes),
     });
   }
 
@@ -75,6 +97,7 @@ export class EvidenceController {
     @Query('scanFindingsOnly') scanFindingsOnly?: string,
     @Query('approvalPendingOnly') approvalPendingOnly?: string,
     @Query('scanTypes') scanTypes?: string | string[],
+    @Query('actionTypes') actionTypes?: string | string[],
   ) {
     return this.evidenceService.exportBundle({
       taskIds: this.normalizeQueryList(taskIds),
@@ -82,6 +105,7 @@ export class EvidenceController {
       scanFindingsOnly: scanFindingsOnly === '1' || scanFindingsOnly === 'true',
       approvalPendingOnly: approvalPendingOnly === '1' || approvalPendingOnly === 'true',
       scanTypes: this.normalizeScanTypes(scanTypes),
+      actionTypes: this.normalizeActionTypes(actionTypes),
     });
   }
 }

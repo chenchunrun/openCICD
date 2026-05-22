@@ -15,6 +15,6 @@ import { WorkflowGeneratorService } from './workflow-generator.service.js';
     HighRiskPathService,
     WorkflowGeneratorService,
   ],
-  exports: [RepoService, RepoOnboardingService, HighRiskPathService],
+  exports: [RepoService, RepoOnboardingService, HighRiskPathService, WorkflowGeneratorService],
 })
 export class RepoModule {}

@@ -34,10 +34,38 @@ export class RepoController {
       return null;
     }
 
+    const workflows = await this.workflowGenerator.inspectWorkflowDefinitions(repo.localPath);
+
     return {
       repoId: repo.id,
       repo: repo.fullName,
-      workflows: this.workflowGenerator.generateAllWorkflows(),
+      localPath: repo.localPath ?? null,
+      workflows,
+    };
+  }
+
+  @Get(':id/workflows/:workflowName')
+  async getWorkflowFile(
+    @Param('id') id: string,
+    @Param('workflowName') workflowName: string,
+  ) {
+    const repo = await this.repoService.findOne(id);
+    if (!repo) {
+      return null;
+    }
+
+    const workflows = this.workflowGenerator.generateWorkflowDefinitions();
+    const workflow = workflows.find((entry) => entry.filename === workflowName);
+    if (!workflow) {
+      return null;
+    }
+
+    return {
+      repoId: repo.id,
+      repo: repo.fullName,
+      workflowName,
+      workflowPath: workflow.installPath,
+      content: workflow.content,
     };
   }
 }

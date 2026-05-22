@@ -9,6 +9,7 @@ type EvidenceExportFilters = {
   scanFindingsOnly?: boolean;
   approvalPendingOnly?: boolean;
   scanTypes?: string[];
+  actionTypes?: string[];
 };
 
 const SUPPORTED_SCAN_TYPES = new Set([
@@ -16,6 +17,16 @@ const SUPPORTED_SCAN_TYPES = new Set([
   'sast_scan',
   'dependency_scan',
   'license_scan',
+]);
+
+const SUPPORTED_ACTION_TYPES = new Set([
+  'task_approved',
+  'task_rejected',
+  'run_stopped',
+  'github_pull_request_created',
+  'github_review_submitted',
+  'github_release_dispatched',
+  'github_release_status_synced',
 ]);
 
 @Injectable()
@@ -73,6 +84,11 @@ export class EvidenceService {
           ? (evidence.contextSection as Record<string, unknown>)
           : {};
 
+      const execution =
+        evidence.executionSection && typeof evidence.executionSection === 'object' && !Array.isArray(evidence.executionSection)
+          ? (evidence.executionSection as Record<string, unknown>)
+          : {};
+
       return {
         evidenceId: evidence.id,
         taskId: evidence.taskId,
@@ -90,6 +106,11 @@ export class EvidenceService {
               ? verificationSection.scanFindings
               : {},
         },
+        execution,
+        deliveryActions:
+          execution.deliveryActions && Array.isArray(execution.deliveryActions)
+            ? execution.deliveryActions
+            : [],
         review: reviewSection,
         repair: repairSection,
         residualRisk: residualRiskSection,
@@ -114,11 +135,24 @@ export class EvidenceService {
       const humanReview = item.review.humanReview;
       const codeOwnerApproval = item.review.codeOwnerApproval;
       const approvalPending = humanReview === 'required' || codeOwnerApproval === 'pending';
+      const hasRequestedActionTypes =
+        !filters.actionTypes?.length ||
+        item.deliveryActions.some((action) => {
+          if (!action || typeof action !== 'object') {
+            return false;
+          }
+
+          const type = (action as Record<string, unknown>).type;
+          return typeof type === 'string' && filters.actionTypes?.includes(type);
+        });
 
       if (filters.scanFindingsOnly && !hasScanFindings) {
         return false;
       }
       if (!hasRequestedScanTypes) {
+        return false;
+      }
+      if (!hasRequestedActionTypes) {
         return false;
       }
       if (filters.approvalPendingOnly && !approvalPending) {
@@ -152,16 +186,92 @@ export class EvidenceService {
 
         return acc;
       }, {}),
+      deliveryActionTotals: filteredItems.reduce<Record<string, number>>((acc, item) => {
+        const execution = item.execution as Record<string, unknown>;
+        const deliveryActions =
+          execution.deliveryActions && Array.isArray(execution.deliveryActions)
+            ? execution.deliveryActions
+            : [];
+
+        for (const action of deliveryActions) {
+          if (!action || typeof action !== 'object') {
+            continue;
+          }
+
+          const type = (action as Record<string, unknown>).type;
+          if (typeof type === 'string') {
+            acc[type] = (acc[type] ?? 0) + 1;
+          }
+        }
+
+        return acc;
+      }, {}),
+      preparationModeTotals: filteredItems.reduce<Record<string, number>>((acc, item) => {
+        const execution = item.execution as Record<string, unknown>;
+        const preparationMode = execution.preparationMode;
+
+        if (typeof preparationMode === 'string' && preparationMode.length > 0) {
+          acc[preparationMode] = (acc[preparationMode] ?? 0) + 1;
+        } else {
+          acc.unknown = (acc.unknown ?? 0) + 1;
+        }
+
+        return acc;
+      }, {}),
+      governanceActionTotals: filteredItems.reduce<Record<string, number>>((acc, item) => {
+        for (const action of item.deliveryActions) {
+          if (!action || typeof action !== 'object') {
+            continue;
+          }
+
+          const type = (action as Record<string, unknown>).type;
+          if (type === 'task_approved') {
+            acc.approved = (acc.approved ?? 0) + 1;
+          } else if (type === 'task_rejected') {
+            acc.rejected = (acc.rejected ?? 0) + 1;
+          } else if (type === 'run_stopped') {
+            acc.stopped = (acc.stopped ?? 0) + 1;
+          }
+        }
+
+        return acc;
+      }, {}),
     };
+
+    const activity = filteredItems
+      .flatMap((item) =>
+        item.deliveryActions
+          .filter((action): action is Record<string, unknown> => Boolean(action) && typeof action === 'object')
+          .map((action) => ({
+            evidenceId: item.evidenceId,
+            taskId: item.taskId,
+            runId: item.runId,
+            repo: item.repo,
+            type: typeof action.type === 'string' ? action.type : 'unknown',
+            timestamp: typeof action.timestamp === 'string' ? action.timestamp : null,
+            targetUrl: typeof action.targetUrl === 'string' ? action.targetUrl : null,
+            actor:
+              action.actor && typeof action.actor === 'object'
+                ? (action.actor as Record<string, unknown>)
+                : null,
+          })),
+      )
+      .sort((left, right) => {
+        const leftTime = left.timestamp ? Date.parse(left.timestamp) : 0;
+        const rightTime = right.timestamp ? Date.parse(right.timestamp) : 0;
+        return rightTime - leftTime;
+      });
 
     return {
       generatedAt: new Date().toISOString(),
       filters: {
         ...filters,
         scanTypes: filters.scanTypes?.filter((scanType) => SUPPORTED_SCAN_TYPES.has(scanType)),
+        actionTypes: filters.actionTypes?.filter((actionType) => SUPPORTED_ACTION_TYPES.has(actionType)),
       },
       summary,
       items: filteredItems,
+      activity,
     };
   }
 

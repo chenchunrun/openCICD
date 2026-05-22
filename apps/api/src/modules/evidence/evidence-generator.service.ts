@@ -8,6 +8,7 @@ const prisma = new PrismaClient();
 type EventRecord = {
   type: string;
   data: unknown;
+  timestamp?: Date | string;
 };
 
 @Injectable()
@@ -44,12 +45,20 @@ export class EvidenceGeneratorService {
       latestReview: run?.reviews?.[0],
     });
     const repairSection = this.buildRepairSection(run?.repairs.length ?? 0, run?.status);
+    const executionStartedEvent = this.getExecutionStartedEvent(run?.events ?? []);
+    const preparationMode =
+      executionStartedEvent?.data && typeof executionStartedEvent.data === 'object'
+        ? (executionStartedEvent.data as Record<string, unknown>).preparationMode
+        : undefined;
+    const deliveryActions = this.buildDeliveryActions(run?.events ?? []);
     const executionSection = {
       commandsRun: run?.commandsRun ?? [],
       filesChanged: run?.filesChanged ?? [],
       networkUsed: run?.networkUsed ?? false,
       secretsAccessed: run?.secretsAccessed ?? false,
-    };
+      preparationMode: typeof preparationMode === 'string' ? preparationMode : 'unknown',
+      deliveryActions,
+    } satisfies Prisma.InputJsonObject;
     const contextSection = this.buildContextSection(task, run?.events ?? []);
     const fullEvidence = {
       schema_version: '1.0',
@@ -106,6 +115,19 @@ export class EvidenceGeneratorService {
 
   private getLatestEvent(events: EventRecord[], type: string): EventRecord | undefined {
     return [...events].reverse().find((event) => event.type === type);
+  }
+
+  private getExecutionStartedEvent(events: EventRecord[]): EventRecord | undefined {
+    return [...events]
+      .reverse()
+      .find(
+        (event) =>
+          event.type === 'status' &&
+          event.data &&
+          typeof event.data === 'object' &&
+          typeof (event.data as Record<string, unknown>).message === 'string' &&
+          ((event.data as Record<string, unknown>).message as string).includes('execution started'),
+      );
   }
 
   private buildVerificationSection(events: EventRecord[]): Prisma.InputJsonObject {
@@ -183,6 +205,49 @@ export class EvidenceGeneratorService {
         requiresHumanApproval: task.requiresHumanApproval,
       },
     };
+  }
+
+  private buildDeliveryActions(events: EventRecord[]): Prisma.InputJsonArray {
+    const deliveryEventTypes = [
+      'task_approved',
+      'task_rejected',
+      'run_stopped',
+      'github_pull_request_created',
+      'github_review_submitted',
+      'github_release_dispatched',
+      'github_release_status_synced',
+    ];
+
+    return events
+      .filter((event) => deliveryEventTypes.includes(event.type))
+      .map((event) => {
+        const data = event.data && typeof event.data === 'object' ? (event.data as Record<string, unknown>) : {};
+        const actor =
+          data.actor && typeof data.actor === 'object'
+            ? ({ ...(data.actor as Record<string, unknown>) } as Prisma.InputJsonObject)
+            : null;
+
+        return {
+          type: event.type,
+          timestamp:
+            event.timestamp instanceof Date
+              ? event.timestamp.toISOString()
+              : typeof event.timestamp === 'string'
+                ? event.timestamp
+                : null,
+          actor,
+          targetUrl:
+            typeof data.pullRequestUrl === 'string'
+              ? data.pullRequestUrl
+              : typeof data.reviewUrl === 'string'
+                ? data.reviewUrl
+                : typeof data.actionsUrl === 'string'
+                  ? data.actionsUrl
+                  : typeof data.htmlUrl === 'string'
+                    ? data.htmlUrl
+                  : null,
+        } satisfies Prisma.InputJsonObject;
+      }) as Prisma.InputJsonArray;
   }
 
   private buildReviewSection(input: {

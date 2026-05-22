@@ -1,12 +1,41 @@
 import { Injectable } from '@nestjs/common';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { stringify as yamlStringify } from 'yaml';
+
+export interface WorkflowDefinition {
+  filename: string;
+  displayName: string;
+  purpose: string;
+  installPath: string;
+  triggers: string[];
+  requiredSecrets: string[];
+  content: string;
+}
+
+export interface WorkflowInstallationState {
+  status: 'installed' | 'missing' | 'drifted' | 'unknown';
+  detail: string;
+}
+
+export interface WorkflowSecretRequirement {
+  name: string;
+  status: 'required_but_unverified';
+  detail: string;
+}
+
+export interface RepoWorkflowDefinition extends WorkflowDefinition {
+  installation: WorkflowInstallationState;
+  secrets: WorkflowSecretRequirement[];
+}
 
 @Injectable()
 export class WorkflowGeneratorService {
+  private readonly apiUrlSecret = 'AICP_API_URL';
   private readonly checkoutStep = { uses: 'actions/checkout@v4' };
   private readonly setupCurlStep = {
     name: 'Prepare API access',
-    run: 'test -n "${{ secrets.AICP_API_URL }}"',
+    run: `test -n "\${{ secrets.${this.apiUrlSecret} }}"`,
   };
 
   generateIntentGateWorkflow(): string {
@@ -214,15 +243,150 @@ export class WorkflowGeneratorService {
     });
   }
 
+  generateWorkflowDefinitions(): WorkflowDefinition[] {
+    return [
+      {
+        filename: 'ai-intent-gate.yml',
+        displayName: 'Intent Gate',
+        purpose:
+          'Normalizes incoming GitHub issues and comments before the control plane schedules agent work.',
+        installPath: '.github/workflows/ai-intent-gate.yml',
+        triggers: ['Issue opened or edited', 'Issue comment created'],
+        requiredSecrets: [this.apiUrlSecret],
+        content: this.generateIntentGateWorkflow(),
+      },
+      {
+        filename: 'ai-agent-run.yml',
+        displayName: 'Agent Run',
+        purpose:
+          'Lets operators dispatch a normalized task from GitHub into the orchestrated runner path.',
+        installPath: '.github/workflows/ai-agent-run.yml',
+        triggers: ['Manual workflow_dispatch with task_id'],
+        requiredSecrets: [this.apiUrlSecret],
+        content: this.generateAgentRunWorkflow(),
+      },
+      {
+        filename: 'ai-review.yml',
+        displayName: 'Review Export',
+        purpose:
+          'Exports the GitHub review payload for a completed run so human reviewers can inspect the generated review package.',
+        installPath: '.github/workflows/ai-review.yml',
+        triggers: ['Manual workflow_dispatch with run_id'],
+        requiredSecrets: [this.apiUrlSecret],
+        content: this.generateReviewWorkflow(),
+      },
+      {
+        filename: 'ai-repair.yml',
+        displayName: 'Repair Trigger',
+        purpose:
+          'Relays failed CI workflow runs back into the control plane so the repair loop can decide whether to attempt self-repair.',
+        installPath: '.github/workflows/ai-repair.yml',
+        triggers: ['CI workflow_run completed with failure'],
+        requiredSecrets: [this.apiUrlSecret],
+        content: this.generateRepairWorkflow(),
+      },
+      {
+        filename: 'ai-policy-test.yml',
+        displayName: 'Policy Test',
+        purpose:
+          'Revalidates policy-sensitive configuration changes before they are merged into the repository.',
+        installPath: '.github/workflows/ai-policy-test.yml',
+        triggers: ['Pull request touching policy-sensitive files'],
+        requiredSecrets: [this.apiUrlSecret],
+        content: this.generatePolicyTestWorkflow(),
+      },
+      {
+        filename: 'ai-evidence.yml',
+        displayName: 'Evidence Export',
+        purpose:
+          'Pulls the evidence bundle for a run and stores it as a GitHub artifact for audit and downstream review.',
+        installPath: '.github/workflows/ai-evidence.yml',
+        triggers: ['Manual workflow_dispatch with run_id'],
+        requiredSecrets: [this.apiUrlSecret],
+        content: this.generateEvidenceWorkflow(),
+      },
+      {
+        filename: 'ai-release.yml',
+        displayName: 'Release Gate',
+        purpose:
+          'Fetches release gate and release plan artifacts so release readiness can be checked before any downstream promotion step.',
+        installPath: '.github/workflows/ai-release.yml',
+        triggers: ['Manual workflow_dispatch with task_id'],
+        requiredSecrets: [this.apiUrlSecret],
+        content: this.generateReleaseWorkflow(),
+      },
+    ];
+  }
+
+  async inspectWorkflowDefinitions(localPath?: string | null): Promise<RepoWorkflowDefinition[]> {
+    const definitions = this.generateWorkflowDefinitions();
+
+    return Promise.all(
+      definitions.map(async (definition) => ({
+        ...definition,
+        installation: await this.inspectWorkflowInstallation(definition, localPath),
+        secrets: definition.requiredSecrets.map((name) => ({
+          name,
+          status: 'required_but_unverified' as const,
+          detail:
+            'GitHub repository secrets cannot be verified from the local checkout. Confirm this secret exists in GitHub before dispatch.',
+        })),
+      })),
+    );
+  }
+
   generateAllWorkflows(): Record<string, string> {
-    return {
-      'ai-intent-gate.yml': this.generateIntentGateWorkflow(),
-      'ai-agent-run.yml': this.generateAgentRunWorkflow(),
-      'ai-review.yml': this.generateReviewWorkflow(),
-      'ai-repair.yml': this.generateRepairWorkflow(),
-      'ai-policy-test.yml': this.generatePolicyTestWorkflow(),
-      'ai-evidence.yml': this.generateEvidenceWorkflow(),
-      'ai-release.yml': this.generateReleaseWorkflow(),
-    };
+    return Object.fromEntries(
+      this.generateWorkflowDefinitions().map((workflow) => [
+        workflow.filename,
+        workflow.content,
+      ]),
+    );
+  }
+
+  private async inspectWorkflowInstallation(
+    definition: WorkflowDefinition,
+    localPath?: string | null,
+  ): Promise<WorkflowInstallationState> {
+    if (!localPath) {
+      return {
+        status: 'unknown',
+        detail: 'No local checkout is connected, so workflow installation cannot be verified.',
+      };
+    }
+
+    try {
+      const localContent = await readFile(join(localPath, definition.installPath), 'utf8');
+      const matches = this.normalizeWorkflowContent(localContent) === this.normalizeWorkflowContent(definition.content);
+      return matches
+        ? {
+            status: 'installed',
+            detail: 'Local workflow matches the generated template.',
+          }
+        : {
+            status: 'drifted',
+            detail: 'Local workflow exists but differs from the generated template.',
+          };
+    } catch (error) {
+      if (this.isMissingFileError(error)) {
+        return {
+          status: 'missing',
+          detail: 'Expected workflow file was not found in the connected local checkout.',
+        };
+      }
+
+      return {
+        status: 'unknown',
+        detail: `Workflow installation could not be verified: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  private normalizeWorkflowContent(content: string): string {
+    return content.trim().replace(/\r\n/g, '\n');
+  }
+
+  private isMissingFileError(error: unknown): error is NodeJS.ErrnoException {
+    return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
   }
 }

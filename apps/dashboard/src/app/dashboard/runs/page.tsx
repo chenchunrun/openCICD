@@ -1,7 +1,16 @@
 import Link from "next/link";
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { getRuns, stopRun } from "@/lib/api-client";
+import {
+  AICP_ACTOR_NAME,
+  AICP_ACTOR_ROLE,
+  canPerformRole,
+  createGithubPullRequest,
+  getRuns,
+  stopRun,
+  submitGithubReview,
+} from "@/lib/api-client";
+import { rethrowIfRedirectError } from "@/lib/server-action";
 
 const STOPPABLE_STATUSES = new Set([
   "queued",
@@ -83,12 +92,85 @@ function getPolicyTone(filesystemMode?: string) {
   }
 }
 
+function getPreparationMode(run: Awaited<ReturnType<typeof getRuns>>[number]) {
+  const statusEvent = [...(run.events ?? [])].reverse().find(
+    (event) =>
+      event.type === "status" &&
+      typeof event.data?.message === "string" &&
+      event.data.message.includes("execution started"),
+  );
+
+  return typeof statusEvent?.data?.preparationMode === "string"
+    ? statusEvent.data.preparationMode
+    : null;
+}
+
+function getActionActorSummary(run: Awaited<ReturnType<typeof getRuns>>[number]) {
+  const actionEvent = [...(run.events ?? [])].find((event) =>
+    [
+      "github_release_dispatched",
+      "github_review_submitted",
+      "github_pull_request_created",
+    ].includes(event.type),
+  );
+
+  if (!actionEvent || !actionEvent.data || typeof actionEvent.data !== "object") {
+    return null;
+  }
+
+  const actor = (actionEvent.data as Record<string, unknown>).actor;
+  if (!actor || typeof actor !== "object") {
+    return null;
+  }
+
+  const record = actor as Record<string, unknown>;
+  const name = typeof record.name === "string" ? record.name : null;
+  const role = typeof record.role === "string" ? record.role : null;
+  const source = typeof record.source === "string" ? record.source : null;
+  const label =
+    actionEvent.type === "github_release_dispatched"
+      ? "Release"
+      : actionEvent.type === "github_review_submitted"
+        ? "Review"
+        : "PR";
+
+  const parts = [name, role, source].filter(Boolean);
+  return {
+    label,
+    summary: parts.length > 0 ? parts.join(" / ") : "Unknown actor",
+  };
+}
+
+function getLatestEventData(
+  run: Awaited<ReturnType<typeof getRuns>>[number],
+  type: string,
+) {
+  return [...(run.events ?? [])]
+    .reverse()
+    .find((event) => event.type === type)?.data;
+}
+
 function getNoticeContent(notice?: string, runId?: string) {
   switch (notice) {
     case "stopped":
       return {
         tone: "success" as const,
         message: `Run ${runId ?? ""} was stopped.`.trim(),
+      };
+    case "pr_created":
+      return {
+        tone: "success" as const,
+        message: `GitHub pull request created for run ${runId ?? ""}.`.trim(),
+      };
+    case "pr_exists":
+      return {
+        tone: "info" as const,
+        message: `A pull request is already linked to run ${runId ?? ""}.`.trim(),
+      };
+    case "review_submitted":
+      return {
+        tone: "success" as const,
+        message: `GitHub review submitted for run ${runId ?? ""}.`.trim(),
       };
     default:
       return null;
@@ -111,7 +193,52 @@ async function stopRunAction(formData: FormData) {
     revalidatePath(`/dashboard/runs/${runId}`);
     redirect(`/dashboard/runs?notice=stopped&runId=${encodeURIComponent(runId)}`);
   } catch (error) {
+    rethrowIfRedirectError(error);
     const message = error instanceof Error ? error.message : "Run stop failed";
+    redirect(`/dashboard/runs?error=${encodeURIComponent(message)}`);
+  }
+}
+
+async function createPullRequestAction(formData: FormData) {
+  "use server";
+
+  try {
+    const runId = formData.get("runId");
+    if (typeof runId !== "string" || runId.length === 0) {
+      throw new Error("runId is required");
+    }
+
+    const result = await createGithubPullRequest(runId);
+    revalidatePath("/dashboard");
+    revalidatePath("/dashboard/runs");
+    revalidatePath(`/dashboard/runs/${runId}`);
+    redirect(
+      `/dashboard/runs?notice=${encodeURIComponent(result.alreadyExists ? "pr_exists" : "pr_created")}&runId=${encodeURIComponent(runId)}`,
+    );
+  } catch (error) {
+    rethrowIfRedirectError(error);
+    const message = error instanceof Error ? error.message : "GitHub PR creation failed";
+    redirect(`/dashboard/runs?error=${encodeURIComponent(message)}`);
+  }
+}
+
+async function submitReviewAction(formData: FormData) {
+  "use server";
+
+  try {
+    const runId = formData.get("runId");
+    if (typeof runId !== "string" || runId.length === 0) {
+      throw new Error("runId is required");
+    }
+
+    await submitGithubReview(runId);
+    revalidatePath("/dashboard");
+    revalidatePath("/dashboard/runs");
+    revalidatePath(`/dashboard/runs/${runId}`);
+    redirect(`/dashboard/runs?notice=review_submitted&runId=${encodeURIComponent(runId)}`);
+  } catch (error) {
+    rethrowIfRedirectError(error);
+    const message = error instanceof Error ? error.message : "GitHub review submission failed";
     redirect(`/dashboard/runs?error=${encodeURIComponent(message)}`);
   }
 }
@@ -127,6 +254,7 @@ export default async function DashboardRunsPage({
   const runIdParam = typeof resolvedSearchParams?.runId === "string" ? resolvedSearchParams.runId : undefined;
   const errorParam = typeof resolvedSearchParams?.error === "string" ? resolvedSearchParams.error : undefined;
   const notice = getNoticeContent(noticeParam, runIdParam);
+  const canOperateGithub = canPerformRole("operator");
 
   return (
     <div className="space-y-6">
@@ -135,6 +263,12 @@ export default async function DashboardRunsPage({
         <p className="mt-1 text-sm text-gray-400">
           Inspect agent execution status and drill into event streams.
         </p>
+      </div>
+
+      <div className="rounded-lg border border-gray-800 bg-gray-900 px-4 py-3 text-sm text-gray-300">
+        Actor: <span className="font-medium text-white">{AICP_ACTOR_NAME}</span> · role{" "}
+        <span className="font-medium text-white">{AICP_ACTOR_ROLE}</span>. GitHub PR creation and review submission require{" "}
+        <span className="font-medium text-sky-200">operator</span> or higher.
       </div>
 
       {notice ? (
@@ -162,6 +296,28 @@ export default async function DashboardRunsPage({
           const securitySummary = getSecurityScanSummary(run);
           const isStoppable = STOPPABLE_STATUSES.has(run.status);
           const networkDomains = run.task?.networkDomains ?? [];
+          const preparationMode = getPreparationMode(run);
+          const actionActorSummary = getActionActorSummary(run);
+          const pullRequestDelivery = getLatestEventData(run, "github_pull_request_created");
+          const reviewDelivery = getLatestEventData(run, "github_review_submitted");
+          const reviewCompleted = getLatestEventData(run, "review_completed");
+          const pullRequestUrl =
+            typeof pullRequestDelivery?.pullRequestUrl === "string"
+              ? pullRequestDelivery.pullRequestUrl
+              : run.pullRequestUrl ?? null;
+          const reviewUrl =
+            typeof reviewDelivery?.reviewUrl === "string"
+              ? reviewDelivery.reviewUrl
+              : null;
+          const reviewVerdict =
+            typeof reviewCompleted?.verdict === "string" ? reviewCompleted.verdict : null;
+          const canSubmitReview =
+            run.status === "completed" &&
+            reviewVerdict !== null &&
+            !reviewUrl;
+          const canCreatePr =
+            run.status === "completed" &&
+            !pullRequestUrl;
 
           return (
             <div
@@ -179,6 +335,11 @@ export default async function DashboardRunsPage({
                   <p className="mt-2 text-sm text-gray-300">Task: {run.taskId}</p>
                   {run.task ? (
                     <div className="mt-3 flex flex-wrap gap-2">
+                      {preparationMode ? (
+                        <span className="rounded-full border border-gray-700 bg-gray-950 px-2 py-1 text-xs text-gray-200">
+                          prep: {preparationMode}
+                        </span>
+                      ) : null}
                       <span
                         className={`rounded-full border px-2 py-1 text-xs ${getPolicyTone(
                           run.task.filesystemMode,
@@ -234,6 +395,13 @@ export default async function DashboardRunsPage({
                   {errorMessage ? (
                     <p className="mt-3 line-clamp-2 text-sm text-red-300">{errorMessage}</p>
                   ) : null}
+                  {actionActorSummary ? (
+                    <div className="mt-3 rounded-md border border-violet-900/50 bg-violet-950/20 px-3 py-2 text-sm text-violet-200">
+                      <p>
+                        {actionActorSummary.label} actor: {actionActorSummary.summary}
+                      </p>
+                    </div>
+                  ) : null}
                   {run.task?.networkMode === "disabled" ? (
                     <p className="mt-3 text-xs text-gray-500">
                       Runtime launched in offline mode.
@@ -259,6 +427,64 @@ export default async function DashboardRunsPage({
                     Started: {run.startedAt ? new Date(run.startedAt).toLocaleString() : "Not started"}
                   </p>
                   <div className="mt-3 flex justify-end gap-2">
+                    {pullRequestUrl ? (
+                      <Link
+                        href={pullRequestUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="rounded-md border border-emerald-800 px-3 py-2 text-xs font-medium text-emerald-200 transition hover:border-emerald-700 hover:bg-emerald-950/30"
+                      >
+                        Open PR
+                      </Link>
+                    ) : (
+                      <form action={createPullRequestAction}>
+                        <input type="hidden" name="runId" value={run.id} />
+                        <button
+                          type="submit"
+                          disabled={!canOperateGithub || !canCreatePr}
+                          className={
+                            canOperateGithub && canCreatePr
+                              ? "rounded-md border border-emerald-800 px-3 py-2 text-xs font-medium text-emerald-200 transition hover:border-emerald-700 hover:bg-emerald-950/30"
+                              : "rounded-md border border-gray-800 px-3 py-2 text-xs font-medium text-gray-500"
+                          }
+                        >
+                          {canOperateGithub
+                            ? canCreatePr
+                              ? "Create PR"
+                              : "PR Not Ready"
+                            : "Operator Required"}
+                        </button>
+                      </form>
+                    )}
+                    {reviewUrl ? (
+                      <Link
+                        href={reviewUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="rounded-md border border-violet-800 px-3 py-2 text-xs font-medium text-violet-200 transition hover:border-violet-700 hover:bg-violet-950/30"
+                      >
+                        Open Review
+                      </Link>
+                    ) : (
+                      <form action={submitReviewAction}>
+                        <input type="hidden" name="runId" value={run.id} />
+                        <button
+                          type="submit"
+                          disabled={!canOperateGithub || !canSubmitReview}
+                          className={
+                            canOperateGithub && canSubmitReview
+                              ? "rounded-md border border-violet-800 px-3 py-2 text-xs font-medium text-violet-200 transition hover:border-violet-700 hover:bg-violet-950/30"
+                              : "rounded-md border border-gray-800 px-3 py-2 text-xs font-medium text-gray-500"
+                          }
+                        >
+                          {canOperateGithub
+                            ? canSubmitReview
+                              ? "Submit Review"
+                              : "Review Not Ready"
+                            : "Operator Required"}
+                        </button>
+                      </form>
+                    )}
                     <Link
                       href={`/dashboard/runs/${run.id}`}
                       className="rounded-md border border-gray-700 px-3 py-2 text-xs font-medium text-gray-200 transition hover:border-gray-600 hover:bg-gray-950"

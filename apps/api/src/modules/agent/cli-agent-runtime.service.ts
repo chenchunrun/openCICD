@@ -1,7 +1,8 @@
 import { Injectable } from '@nestjs/common';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { access, chmod, cp, lstat, mkdir, readdir, readFile, rm, symlink } from 'node:fs/promises';
-import { join, relative } from 'node:path';
+import { dirname, join, relative } from 'node:path';
+import { matchAnyGlob } from '@aicp/shared';
 import type { AgentEvidence, AgentRunPlan, DiffFile, GitDiff } from '@aicp/shared';
 
 interface SnapshotEntry {
@@ -21,7 +22,7 @@ interface AgentRuntimeRecord {
   stopRequested: boolean;
   initialSnapshot: Promise<Map<string, SnapshotEntry>>;
   preparedSandboxDir: string;
-  preparedWithGitWorktree: boolean;
+  preparationMode: 'direct' | 'git_worktree' | 'synthetic_git' | 'snapshot_copy';
   stdoutBuffer: string;
   stderrBuffer: string;
   child?: ChildProcess;
@@ -98,8 +99,14 @@ export class CliAgentRuntimeService {
     const queue = new AsyncEventQueue();
     const existingRecord = this.records.get(plan.runId);
     const preparedSandboxDir = plan.sandboxDir || plan.workingDirectory;
-    const preparedWithGitWorktree = await this.prepareWorkingDirectory(plan, existingRecord);
-    const initialSnapshot = existingRecord?.initialSnapshot ?? this.captureSnapshot(preparedSandboxDir);
+    const preparationMode = await this.prepareWorkingDirectory(plan, existingRecord);
+    const initialSnapshotData =
+      existingRecord?.initialSnapshot
+        ? await existingRecord.initialSnapshot
+        : preparationMode === 'snapshot_copy' || preparationMode === 'direct'
+          ? await this.captureSnapshot(preparedSandboxDir)
+          : new Map<string, SnapshotEntry>();
+    const initialSnapshot = Promise.resolve(initialSnapshotData);
     const commandLine = [plan.command, ...plan.args];
     const executionEnv = this.buildExecutionEnv(plan);
     const child = spawn(plan.command, plan.args, {
@@ -125,7 +132,7 @@ export class CliAgentRuntimeService {
       stopRequested: existingRecord?.stopRequested ?? false,
       initialSnapshot,
       preparedSandboxDir,
-      preparedWithGitWorktree,
+      preparationMode,
       stdoutBuffer: '',
       stderrBuffer: '',
       child,
@@ -157,7 +164,10 @@ export class CliAgentRuntimeService {
         message: startedMessage,
         command: commandLine.join(' '),
         workingDirectory: preparedSandboxDir,
+        preparationMode,
         filesystemMode: plan.filesystemMode,
+        allowedPaths: plan.allowedPaths,
+        forbiddenPaths: plan.forbiddenPaths,
         networkMode: plan.networkMode,
         networkDomains: plan.networkDomains,
       },
@@ -223,10 +233,8 @@ export class CliAgentRuntimeService {
     }
 
     record.child?.kill('SIGTERM');
-    if (record.filesystemMode === 'read_only') {
-      await this.makeWritable(record.preparedSandboxDir);
-    }
-    if (record.preparedWithGitWorktree) {
+    await this.makeWritable(record.preparedSandboxDir);
+    if (record.preparationMode === 'git_worktree') {
       await this.removeGitWorktree(record.sourceWorkingDirectory, record.preparedSandboxDir);
     } else {
       await rm(record.preparedSandboxDir, { recursive: true, force: true });
@@ -452,13 +460,13 @@ export class CliAgentRuntimeService {
   private async prepareWorkingDirectory(
     plan: AgentRunPlan,
     existingRecord?: AgentRuntimeRecord,
-  ): Promise<boolean> {
+  ): Promise<AgentRuntimeRecord['preparationMode']> {
     if (plan.sandboxDir === plan.workingDirectory) {
-      return false;
+      return 'direct';
     }
 
     if (existingRecord?.preparedSandboxDir === plan.sandboxDir) {
-      return existingRecord.preparedWithGitWorktree;
+      return existingRecord.preparationMode;
     }
 
     const sourceIsGitRepo = await this.isGitRepository(plan.workingDirectory);
@@ -467,8 +475,14 @@ export class CliAgentRuntimeService {
       await this.linkWorkspaceNodeModules(plan.workingDirectory, plan.sandboxDir);
       if (plan.filesystemMode === 'read_only') {
         await this.applyReadOnly(plan.sandboxDir);
+      } else if (plan.filesystemMode === 'workspace_write') {
+        await this.applyWorkspaceWriteRestrictions(
+          plan.sandboxDir,
+          plan.allowedPaths,
+          plan.forbiddenPaths,
+        );
       }
-      return true;
+      return 'git_worktree';
     }
 
     await rm(plan.sandboxDir, { recursive: true, force: true });
@@ -488,14 +502,35 @@ export class CliAgentRuntimeService {
     });
 
     await this.linkWorkspaceNodeModules(plan.workingDirectory, plan.sandboxDir);
+    const preparedSyntheticGit = await this.prepareSyntheticGitRepository(plan.sandboxDir);
     if (plan.filesystemMode === 'read_only') {
       await this.applyReadOnly(plan.sandboxDir);
+    } else if (plan.filesystemMode === 'workspace_write') {
+      await this.applyWorkspaceWriteRestrictions(
+        plan.sandboxDir,
+        plan.allowedPaths,
+        plan.forbiddenPaths,
+      );
     }
-    return false;
+    return preparedSyntheticGit ? 'synthetic_git' : 'snapshot_copy';
   }
 
   private async applyReadOnly(root: string): Promise<void> {
     await this.setPermissionsRecursive(root, 0o555, 0o444);
+  }
+
+  private async applyWorkspaceWriteRestrictions(
+    root: string,
+    allowedPaths: string[],
+    forbiddenPaths: string[],
+  ): Promise<void> {
+    if (allowedPaths.length === 0 && forbiddenPaths.length === 0) {
+      return;
+    }
+
+    await this.applyReadOnly(root);
+    const writableDirectoryPrefixes = this.buildWritableDirectoryPrefixes(allowedPaths, forbiddenPaths);
+    await this.makePathWritableRecursive(root, root, allowedPaths, forbiddenPaths, writableDirectoryPrefixes);
   }
 
   private async makeWritable(root: string): Promise<void> {
@@ -532,6 +567,122 @@ export class CliAgentRuntimeService {
     if (stats.isFile()) {
       await chmod(currentPath, fileMode).catch(() => undefined);
     }
+  }
+
+  private async makePathWritableRecursive(
+    root: string,
+    currentPath: string,
+    allowedPaths: string[],
+    forbiddenPaths: string[],
+    writableDirectoryPrefixes: Set<string>,
+  ): Promise<void> {
+    let stats;
+    try {
+      stats = await lstat(currentPath);
+    } catch {
+      return;
+    }
+
+    if (stats.isSymbolicLink()) {
+      return;
+    }
+
+    const relativePath = relative(root, currentPath).replaceAll('\\', '/');
+    const normalizedRelativePath = relativePath === '' ? '.' : relativePath;
+
+    if (stats.isDirectory()) {
+      const shouldMakeWritable =
+        normalizedRelativePath === '.' ||
+        writableDirectoryPrefixes.has(normalizedRelativePath) ||
+        this.isDirectoryDirectlyAllowed(normalizedRelativePath, allowedPaths, forbiddenPaths);
+
+      if (shouldMakeWritable) {
+        await chmod(currentPath, 0o755).catch(() => undefined);
+      }
+
+      const entries = await readdir(currentPath, { withFileTypes: true }).catch(() => [] as Array<{ name: string }>);
+      for (const entry of entries) {
+        if (SNAPSHOT_IGNORE_DIRS.has(entry.name) || entry.name === '.git') {
+          continue;
+        }
+        await this.makePathWritableRecursive(
+          root,
+          join(currentPath, entry.name),
+          allowedPaths,
+          forbiddenPaths,
+          writableDirectoryPrefixes,
+        );
+      }
+      return;
+    }
+
+    if (!stats.isFile()) {
+      return;
+    }
+
+    if (
+      matchAnyGlob(allowedPaths, normalizedRelativePath) &&
+      !matchAnyGlob(forbiddenPaths, normalizedRelativePath)
+    ) {
+      await chmod(currentPath, 0o644).catch(() => undefined);
+    }
+  }
+
+  private isDirectoryDirectlyAllowed(
+    relativeDirectory: string,
+    allowedPaths: string[],
+    forbiddenPaths: string[],
+  ): boolean {
+    const withGlob = `${relativeDirectory}/**`;
+    return (
+      matchAnyGlob(allowedPaths, relativeDirectory) ||
+      (matchAnyGlob(allowedPaths, withGlob) && !matchAnyGlob(forbiddenPaths, withGlob))
+    );
+  }
+
+  private buildWritableDirectoryPrefixes(
+    allowedPaths: string[],
+    forbiddenPaths: string[],
+  ): Set<string> {
+    const prefixes = new Set<string>(['.']);
+
+    for (const pattern of allowedPaths) {
+      const staticPrefix = this.getStaticPathPrefix(pattern);
+      if (!staticPrefix) {
+        continue;
+      }
+
+      const segments = staticPrefix.split('/').filter(Boolean);
+      let current = '';
+      for (const segment of segments) {
+        current = current ? `${current}/${segment}` : segment;
+        if (!matchAnyGlob(forbiddenPaths, current) && !matchAnyGlob(forbiddenPaths, `${current}/**`)) {
+          prefixes.add(current);
+        }
+      }
+    }
+
+    return prefixes;
+  }
+
+  private getStaticPathPrefix(pattern: string): string {
+    const normalized = pattern.replaceAll('\\', '/');
+    const segments = normalized.split('/');
+    const staticSegments: string[] = [];
+
+    for (const segment of segments) {
+      if (segment.includes('*') || segment.includes('?')) {
+        break;
+      }
+      staticSegments.push(segment);
+    }
+
+    if (staticSegments.length === 0) {
+      return '';
+    }
+
+    const joined = staticSegments.join('/');
+    return normalized.endsWith('/') ? joined : dirname(joined).replaceAll('\\', '/');
   }
 
   private async linkDirectoryIfPresent(source: string, target: string): Promise<void> {
@@ -595,6 +746,23 @@ export class CliAgentRuntimeService {
   private async removeGitWorktree(sourceRoot: string, sandboxDir: string): Promise<void> {
     await this.runGitCommand(sourceRoot, ['worktree', 'remove', '--force', sandboxDir]);
     await rm(sandboxDir, { recursive: true, force: true });
+  }
+
+  private async prepareSyntheticGitRepository(sandboxDir: string): Promise<boolean> {
+    const initResult = await this.runGitCommand(sandboxDir, ['init']);
+    if (initResult.exitCode !== 0) {
+      return false;
+    }
+
+    await this.runGitCommand(sandboxDir, ['config', 'user.name', 'AI Control Plane']);
+    await this.runGitCommand(sandboxDir, ['config', 'user.email', 'aicp@example.com']);
+    await this.runGitCommand(sandboxDir, ['add', '.']);
+    const commitResult = await this.runGitCommand(sandboxDir, ['commit', '-m', 'sandbox baseline']);
+    if (commitResult.exitCode !== 0) {
+      return false;
+    }
+
+    return true;
   }
 
   private async collectSnapshotDiff(record: AgentRuntimeRecord): Promise<GitDiff> {

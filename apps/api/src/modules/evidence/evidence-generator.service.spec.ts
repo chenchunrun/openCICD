@@ -65,7 +65,16 @@ describe('EvidenceGeneratorService', () => {
       secretsAccessed: false,
       events: [
         {
+          type: 'status',
+          timestamp: '2026-05-21T00:00:00.000Z',
+          data: {
+            message: 'Agent execution started',
+            preparationMode: 'synthetic_git',
+          },
+        },
+        {
           type: 'context_brokered',
+          timestamp: '2026-05-21T00:00:01.000Z',
           data: {
             taskId: 'task-1',
             sourceType: 'manual',
@@ -84,6 +93,7 @@ describe('EvidenceGeneratorService', () => {
         },
         {
           type: 'verification_completed',
+          timestamp: '2026-05-21T00:00:02.000Z',
           data: {
             checks: {
               lint: 'passed',
@@ -102,6 +112,30 @@ describe('EvidenceGeneratorService', () => {
                 match: '"license": "BUSL-1.1"',
               },
             ],
+          },
+        },
+        {
+          type: 'github_pull_request_created',
+          timestamp: '2026-05-21T00:00:03.000Z',
+          data: {
+            pullRequestUrl: 'https://github.com/acme/service/pull/42',
+            actor: {
+              role: 'operator',
+              name: 'release-bot',
+              source: 'dashboard',
+            },
+          },
+        },
+        {
+          type: 'task_approved',
+          timestamp: '2026-05-21T00:00:04.000Z',
+          data: {
+            approver: 'alice',
+            actor: {
+              role: 'releaser',
+              name: 'release-manager',
+              source: 'dashboard',
+            },
           },
         },
       ],
@@ -138,6 +172,29 @@ describe('EvidenceGeneratorService', () => {
           filesChanged: ['apps/api/src/app.ts'],
           networkUsed: false,
           secretsAccessed: false,
+          preparationMode: 'synthetic_git',
+          deliveryActions: [
+            {
+              type: 'github_pull_request_created',
+              timestamp: '2026-05-21T00:00:03.000Z',
+              actor: {
+                role: 'operator',
+                name: 'release-bot',
+                source: 'dashboard',
+              },
+              targetUrl: 'https://github.com/acme/service/pull/42',
+            },
+            {
+              type: 'task_approved',
+              timestamp: '2026-05-21T00:00:04.000Z',
+              actor: {
+                role: 'releaser',
+                name: 'release-manager',
+                source: 'dashboard',
+              },
+              targetUrl: null,
+            },
+          ],
         },
         verificationSection: {
           lint: 'passed',
@@ -187,6 +244,29 @@ describe('EvidenceGeneratorService', () => {
           filesChanged: ['apps/api/src/app.ts'],
           networkUsed: false,
           secretsAccessed: false,
+          preparationMode: 'synthetic_git',
+          deliveryActions: [
+            {
+              type: 'github_pull_request_created',
+              timestamp: '2026-05-21T00:00:03.000Z',
+              actor: {
+                role: 'operator',
+                name: 'release-bot',
+                source: 'dashboard',
+              },
+              targetUrl: 'https://github.com/acme/service/pull/42',
+            },
+            {
+              type: 'task_approved',
+              timestamp: '2026-05-21T00:00:04.000Z',
+              actor: {
+                role: 'releaser',
+                name: 'release-manager',
+                source: 'dashboard',
+              },
+              targetUrl: null,
+            },
+          ],
         },
         verification: {
           lint: 'passed',

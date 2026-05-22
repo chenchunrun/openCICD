@@ -1,6 +1,26 @@
 const API_URL =
   process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";
 
+export const AICP_ACTOR_ROLE =
+  process.env.AICP_DASHBOARD_ROLE ??
+  (process.env.NODE_ENV === "production" ? "viewer" : "admin");
+export const AICP_ACTOR_NAME =
+  process.env.AICP_DASHBOARD_ACTOR ??
+  (process.env.NODE_ENV === "production" ? "dashboard" : "local-admin");
+export const AICP_ACTOR_SOURCE = "dashboard";
+
+const ROLE_LEVEL = {
+  viewer: 0,
+  operator: 1,
+  releaser: 2,
+  admin: 3,
+} as const;
+
+export function canPerformRole(requiredRole: keyof typeof ROLE_LEVEL) {
+  const actorLevel = ROLE_LEVEL[AICP_ACTOR_ROLE as keyof typeof ROLE_LEVEL] ?? ROLE_LEVEL.viewer;
+  return actorLevel >= ROLE_LEVEL[requiredRole];
+}
+
 async function readErrorMessage(response: Response, fallback: string): Promise<string> {
   try {
     const payload = (await response.json()) as { message?: string | string[] };
@@ -27,7 +47,12 @@ async function readErrorMessage(response: Response, fallback: string): Promise<s
 async function request<T>(path: string): Promise<T> {
   const url = `${API_URL}${path}`;
   const response = await fetch(url, {
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "x-aicp-role": AICP_ACTOR_ROLE,
+      "x-aicp-actor": AICP_ACTOR_NAME,
+      "x-aicp-source": AICP_ACTOR_SOURCE,
+    },
     next: { revalidate: 0 },
   });
 
@@ -45,7 +70,12 @@ async function request<T>(path: string): Promise<T> {
 async function postJson<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(`${API_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "x-aicp-role": AICP_ACTOR_ROLE,
+      "x-aicp-actor": AICP_ACTOR_NAME,
+      "x-aicp-source": AICP_ACTOR_SOURCE,
+    },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
 
@@ -66,6 +96,7 @@ export function getEvidenceExportBundleUrl(filters?: {
   scanFindingsOnly?: boolean;
   approvalPendingOnly?: boolean;
   scanTypes?: string[];
+  actionTypes?: string[];
 }) {
   const url = new URL(`${API_URL}/api/evidence/export/bundle`);
 
@@ -84,8 +115,60 @@ export function getEvidenceExportBundleUrl(filters?: {
   if (filters?.scanTypes?.length) {
     url.searchParams.set("scanTypes", filters.scanTypes.join(","));
   }
+  if (filters?.actionTypes?.length) {
+    url.searchParams.set("actionTypes", filters.actionTypes.join(","));
+  }
 
   return url.toString();
+}
+
+export interface EvidenceExportBundleResponse {
+  generatedAt: string;
+  filters: {
+    taskIds?: string[];
+    runIds?: string[];
+    scanFindingsOnly?: boolean;
+    approvalPendingOnly?: boolean;
+    scanTypes?: string[];
+    actionTypes?: string[];
+  };
+  summary: {
+    evidenceCount: number;
+    failedVerificationCount: number;
+    approvalPendingCount: number;
+    scanFindingTotals: Record<string, number>;
+    deliveryActionTotals: Record<string, number>;
+    preparationModeTotals: Record<string, number>;
+    governanceActionTotals: Record<string, number>;
+  };
+  items: Array<{
+    evidenceId: string;
+    taskId?: string | null;
+    runId?: string | null;
+    repo?: string | null;
+    schemaVersion?: string | null;
+    status?: string | null;
+    createdAt: string;
+    execution: Record<string, unknown>;
+    verification: {
+      checks: Record<string, unknown>;
+      scanFindings: Record<string, unknown>;
+    };
+    review: Record<string, unknown>;
+    repair: Record<string, unknown>;
+    residualRisk: Record<string, unknown>;
+    context: Record<string, unknown>;
+  }>;
+  activity: Array<{
+    evidenceId: string;
+    taskId?: string | null;
+    runId?: string | null;
+    repo?: string | null;
+    type: string;
+    timestamp: string | null;
+    targetUrl: string | null;
+    actor: Record<string, unknown> | null;
+  }>;
 }
 
 export interface Task {
@@ -106,6 +189,59 @@ export interface Repo {
   packageManager?: string | null;
   hasAgentsMd?: boolean;
   hasClaudeMd?: boolean;
+}
+
+export interface RepoWorkflowBundle {
+  repoId: string;
+  repo: string;
+  localPath: string | null;
+  workflows: RepoWorkflowDefinition[];
+}
+
+export interface RepoWorkflowFile {
+  repoId: string;
+  repo: string;
+  workflowName: string;
+  workflowPath: string;
+  content: string;
+}
+
+export interface RepoWorkflowDefinition {
+  filename: string;
+  displayName: string;
+  purpose: string;
+  installPath: string;
+  triggers: string[];
+  requiredSecrets: string[];
+  content: string;
+  installation: {
+    status: "installed" | "missing" | "drifted" | "unknown";
+    detail: string;
+  };
+  secrets: Array<{
+    name: string;
+    status: "required_but_unverified";
+    detail: string;
+  }>;
+}
+
+export interface WorkflowIntegrityIssue {
+  repoId: string;
+  repo: string;
+  localPath: string | null;
+  status: "missing" | "drifted" | "unknown";
+  workflowNames: string[];
+  detail: string;
+}
+
+export interface ReleaseWorkflowBlockerIssue {
+  taskId: string;
+  goal: string;
+  repo: string | null;
+  status: "missing" | "drifted" | "unknown";
+  workflowPath: string;
+  detail: string;
+  blockers: string[];
 }
 
 export interface Run {
@@ -163,6 +299,16 @@ export interface Evidence {
     filesChanged?: string[];
     networkUsed?: boolean;
     secretsAccessed?: boolean;
+    preparationMode?: string;
+    deliveryActions?: Array<{
+      type?: string;
+      actor?: {
+        role?: string;
+        name?: string;
+        source?: string;
+      } | null;
+      targetUrl?: string | null;
+    }>;
   } | null;
   verificationSection?: Record<string, unknown> | null;
   reviewSection?: {
@@ -312,11 +458,56 @@ export interface ReleasePlanResponse {
       requiresHumanApproval?: boolean;
     };
   } | null;
+  deliveryActions: Array<{
+    type?: string;
+    actor?: {
+      role?: string;
+      name?: string;
+      source?: string;
+    } | null;
+    timestamp?: string | null;
+    status?: string | null;
+    conclusion?: string | null;
+    workflowRunId?: number | null;
+    targetUrl?: string | null;
+  }>;
+  githubDispatch: {
+    ready: boolean;
+    workflow: string;
+    workflowPath: string;
+    actionsUrl: string | null;
+    dispatchUrl: string | null;
+  };
   releaseNotes: string;
   rollbackPlan: string[];
   deploymentRecommendation: "ready" | "blocked";
   blockers: string[];
   warnings: string[];
+}
+
+export interface GithubReleaseDispatchResult {
+  taskId: string;
+  dispatched: boolean;
+  workflow: string;
+  repo: string;
+  ref: string;
+  actionsUrl: string;
+}
+
+export interface GithubReleaseSyncResult {
+  taskId: string;
+  synced: boolean;
+  found: boolean;
+  unchanged?: boolean;
+  workflow: string;
+  repo: string;
+  ref: string;
+  workflowRunId?: number | null;
+  runNumber?: number | null;
+  status?: string;
+  conclusion?: string | null;
+  htmlUrl?: string | null;
+  actionsUrl?: string | null;
 }
 
 export interface Policy {
@@ -362,6 +553,123 @@ export async function getRepos(): Promise<Repo[]> {
   return request<Repo[]>("/api/repos");
 }
 
+export async function getRepoWorkflows(repoId: string): Promise<RepoWorkflowBundle | null> {
+  return request<RepoWorkflowBundle | null>(`/api/repos/${repoId}/workflows`);
+}
+
+export async function getWorkflowIntegrityIssues(): Promise<WorkflowIntegrityIssue[]> {
+  const repos = await requestOrDefault<Repo[]>("/api/repos", []);
+  const workflowBundles = await Promise.all(
+    repos.map(async (repo) => ({
+      repo,
+      bundle: await requestOrDefault<RepoWorkflowBundle | null>(`/api/repos/${repo.id}/workflows`, null),
+    })),
+  );
+
+  return workflowBundles.flatMap(({ repo, bundle }) => {
+    if (!bundle) {
+      return [];
+    }
+
+    const groupedStatuses = (["missing", "drifted", "unknown"] as const)
+      .map((status) => {
+        const workflows = bundle.workflows.filter((workflow) => workflow.installation.status === status);
+        if (workflows.length === 0) {
+          return null;
+        }
+
+        return {
+          repoId: repo.id,
+          repo: repo.fullName,
+          localPath: bundle.localPath,
+          status,
+          workflowNames: workflows.map((workflow) => workflow.filename),
+          detail: workflows[0]?.installation.detail ?? "Workflow state is unavailable.",
+        } satisfies WorkflowIntegrityIssue;
+      })
+      .filter((issue): issue is WorkflowIntegrityIssue => issue !== null);
+
+    return groupedStatuses;
+  });
+}
+
+export async function getReleaseWorkflowBlockerIssues(): Promise<ReleaseWorkflowBlockerIssue[]> {
+  const tasks = await requestOrDefault<Task[]>("/api/tasks", []);
+  const candidateTasks = tasks
+    .filter((task) => ["completed", "failed", "stopped", "in_progress"].includes(task.status))
+    .slice(0, 8);
+
+  const releaseItems = await Promise.all(
+    candidateTasks.map(async (task) => {
+      const [gate, plan] = await Promise.all([
+        requestOrDefault<ReleaseGateResponse>(`/api/release/task/${task.id}/gate`, {
+          canRelease: false,
+          latestRunId: null,
+          brokeredContext: null,
+          blockers: [],
+          warnings: [],
+          checks: {},
+        }),
+        requestOrDefault<ReleasePlanResponse>(`/api/release/task/${task.id}/plan`, {
+          taskId: task.id,
+          repo: null,
+          sourceSha: null,
+          baseBranch: null,
+          headBranch: null,
+          compareUrl: null,
+          brokeredContext: null,
+          deliveryActions: [],
+          githubDispatch: {
+            ready: false,
+            workflow: "ai-release.yml",
+            workflowPath: ".github/workflows/ai-release.yml",
+            actionsUrl: null,
+            dispatchUrl: null,
+          },
+          releaseNotes: "",
+          rollbackPlan: [],
+          deploymentRecommendation: "blocked",
+          blockers: [],
+          warnings: [],
+        }),
+      ]);
+
+      return { task, gate, plan };
+    }),
+  );
+
+  return releaseItems.flatMap(({ task, gate, plan }) => {
+    const workflowCheck = gate.checks.github_release_workflow_installed;
+    if (!workflowCheck) {
+      return [];
+    }
+
+    const missing = gate.blockers.some((blocker) => blocker.includes("is missing from the connected checkout"));
+    const drifted = gate.blockers.some((blocker) => blocker.includes("has drifted from the generated template"));
+    const unknown = gate.warnings.some((warning) => warning.includes("could not be locally verified"));
+
+    if (!missing && !drifted && !unknown) {
+      return [];
+    }
+
+    return [
+      {
+        taskId: task.id,
+        goal: task.goal,
+        repo: plan.repo,
+        status: missing ? "missing" : drifted ? "drifted" : "unknown",
+        workflowPath: plan.githubDispatch.workflowPath,
+        detail: workflowCheck.detail,
+        blockers: gate.blockers,
+      } satisfies ReleaseWorkflowBlockerIssue,
+    ];
+  });
+}
+
+export function getRepoWorkflowFileUrl(repoId: string, workflowName: string): string {
+  return `${API_URL}/api/repos/${repoId}/workflows/${encodeURIComponent(workflowName)}`;
+}
+
 export async function createRepo(input: {
   platform: string;
   owner: string;
@@ -372,7 +680,12 @@ export async function createRepo(input: {
 }): Promise<Repo> {
   const response = await fetch(`${API_URL}/api/repos`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "x-aicp-role": AICP_ACTOR_ROLE,
+      "x-aicp-actor": AICP_ACTOR_NAME,
+      "x-aicp-source": AICP_ACTOR_SOURCE,
+    },
     body: JSON.stringify(input),
   });
 
@@ -419,6 +732,19 @@ export async function getRunRepairs(runId: string): Promise<RepairLoop[]> {
   return request<RepairLoop[]>(`/api/repairs/run/${runId}`);
 }
 
+export async function getEvidenceExportBundle(filters?: {
+  taskIds?: string[];
+  runIds?: string[];
+  scanFindingsOnly?: boolean;
+  approvalPendingOnly?: boolean;
+  scanTypes?: string[];
+  actionTypes?: string[];
+}): Promise<EvidenceExportBundleResponse> {
+  return request<EvidenceExportBundleResponse>(
+    getEvidenceExportBundleUrl(filters).replace(API_URL, ""),
+  );
+}
+
 export async function getRunReviewDraft(runId: string): Promise<ReviewDraftPayload> {
   return request<ReviewDraftPayload>(`/api/reviews/run/${runId}/draft`);
 }
@@ -447,12 +773,34 @@ export async function getReleasePlan(taskId: string): Promise<ReleasePlanRespons
   return request<ReleasePlanResponse>(`/api/release/task/${taskId}/plan`);
 }
 
+export async function dispatchGithubRelease(taskId: string): Promise<GithubReleaseDispatchResult> {
+  return postJson<GithubReleaseDispatchResult>(`/api/release/task/${taskId}/github/dispatch`);
+}
+
+export async function syncGithubReleaseStatus(taskId: string): Promise<GithubReleaseSyncResult> {
+  return postJson<GithubReleaseSyncResult>(`/api/release/task/${taskId}/github/sync`);
+}
+
 export async function getPolicies(): Promise<Policy[]> {
   return request<Policy[]>("/api/policies");
 }
 
 export async function executeTask(taskId: string): Promise<{ taskId: string; status: string }> {
   return postJson<{ taskId: string; status: string }>(`/api/orchestrator/tasks/${taskId}/execute`);
+}
+
+export async function approveTask(taskId: string, reason?: string): Promise<Task> {
+  return postJson<Task>(`/api/tasks/${taskId}/approve`, {
+    approver: AICP_ACTOR_NAME,
+    ...(reason ? { reason } : {}),
+  });
+}
+
+export async function rejectTask(taskId: string, reason: string): Promise<Task> {
+  return postJson<Task>(`/api/tasks/${taskId}/reject`, {
+    approver: AICP_ACTOR_NAME,
+    reason,
+  });
 }
 
 export async function createTask(input: {
@@ -466,7 +814,12 @@ export async function createTask(input: {
 }): Promise<Task> {
   const response = await fetch(`${API_URL}/api/tasks`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "x-aicp-role": AICP_ACTOR_ROLE,
+      "x-aicp-actor": AICP_ACTOR_NAME,
+      "x-aicp-source": AICP_ACTOR_SOURCE,
+    },
     body: JSON.stringify({
       repoId: input.repoId,
       source: { type: "manual" },
@@ -504,12 +857,47 @@ export async function getDashboardStats(): Promise<{
   approvalPendingEvidence: number;
   brokeredApprovalBlocks: number;
   scanEscalatedApprovalBlocks: number;
+  totalScanFindings: number;
+  governanceApprovals: number;
+  governanceRejections: number;
+  governanceStops: number;
+  prDeliveries: number;
+  reviewDeliveries: number;
+  releaseDispatches: number;
+  gitWorktreeEvidence: number;
+  syntheticGitEvidence: number;
+  workflowInstalledRepos: number;
+  workflowMissingCount: number;
+  workflowDriftedCount: number;
+  workflowUnknownCount: number;
 }> {
-  const [tasks, runs, evidences] = await Promise.all([
+  const [tasks, runs, evidences, evidenceBundle, repos] = await Promise.all([
     requestOrDefault<Task[]>("/api/tasks", []),
     requestOrDefault<Run[]>("/api/runs", []),
     requestOrDefault<Evidence[]>("/api/evidence", []),
+    requestOrDefault<EvidenceExportBundleResponse>("/api/evidence/export/bundle", {
+      generatedAt: new Date(0).toISOString(),
+      filters: {},
+      summary: {
+        evidenceCount: 0,
+        failedVerificationCount: 0,
+        approvalPendingCount: 0,
+        scanFindingTotals: {},
+        deliveryActionTotals: {},
+        preparationModeTotals: {},
+        governanceActionTotals: {},
+      },
+      items: [],
+      activity: [],
+    }),
+    requestOrDefault<Repo[]>("/api/repos", []),
   ]);
+  const workflowBundles = await Promise.all(
+    repos.map((repo) =>
+      requestOrDefault<RepoWorkflowBundle | null>(`/api/repos/${repo.id}/workflows`, null),
+    ),
+  );
+  const workflowStates = workflowBundles.flatMap((bundle) => bundle?.workflows ?? []);
   const brokeredApprovalBlocks = (
     await Promise.all(
       tasks
@@ -581,5 +969,23 @@ export async function getDashboardStats(): Promise<{
     ).length,
     brokeredApprovalBlocks,
     scanEscalatedApprovalBlocks,
+    totalScanFindings: Object.values(evidenceBundle.summary.scanFindingTotals).reduce(
+      (sum, count) => sum + count,
+      0,
+    ),
+    governanceApprovals: evidenceBundle.summary.governanceActionTotals.approved ?? 0,
+    governanceRejections: evidenceBundle.summary.governanceActionTotals.rejected ?? 0,
+    governanceStops: evidenceBundle.summary.governanceActionTotals.stopped ?? 0,
+    prDeliveries: evidenceBundle.summary.deliveryActionTotals.github_pull_request_created ?? 0,
+    reviewDeliveries: evidenceBundle.summary.deliveryActionTotals.github_review_submitted ?? 0,
+    releaseDispatches: evidenceBundle.summary.deliveryActionTotals.github_release_dispatched ?? 0,
+    gitWorktreeEvidence: evidenceBundle.summary.preparationModeTotals.git_worktree ?? 0,
+    syntheticGitEvidence: evidenceBundle.summary.preparationModeTotals.synthetic_git ?? 0,
+    workflowInstalledRepos: workflowBundles.filter(
+      (bundle) => bundle && bundle.workflows.every((workflow) => workflow.installation.status === "installed"),
+    ).length,
+    workflowMissingCount: workflowStates.filter((workflow) => workflow.installation.status === "missing").length,
+    workflowDriftedCount: workflowStates.filter((workflow) => workflow.installation.status === "drifted").length,
+    workflowUnknownCount: workflowStates.filter((workflow) => workflow.installation.status === "unknown").length,
   };
 }

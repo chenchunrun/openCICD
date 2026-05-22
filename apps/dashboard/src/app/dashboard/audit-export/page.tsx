@@ -1,71 +1,9 @@
 import Link from "next/link";
-import { getEvidenceExportBundleUrl, getEvidences, type Evidence } from "@/lib/api-client";
-
-function countScanFindings(section?: Evidence["verificationSection"]) {
-  const scanFindings =
-    section?.scanFindings && typeof section.scanFindings === "object"
-      ? (section.scanFindings as Record<string, unknown>)
-      : null;
-
-  if (!scanFindings) {
-    return {
-      secret: 0,
-      sast: 0,
-      dependency: 0,
-      license: 0,
-    };
-  }
-
-  return {
-    secret: Array.isArray(scanFindings.secret_scan) ? scanFindings.secret_scan.length : 0,
-    sast: Array.isArray(scanFindings.sast_scan) ? scanFindings.sast_scan.length : 0,
-    dependency: Array.isArray(scanFindings.dependency_scan) ? scanFindings.dependency_scan.length : 0,
-    license: Array.isArray(scanFindings.license_scan) ? scanFindings.license_scan.length : 0,
-  };
-}
-
-function buildExportPreview(evidences: Evidence[]) {
-  return evidences.reduce(
-    (acc, evidence) => {
-      const scanCounts = countScanFindings(evidence.verificationSection);
-      const verificationFailed = Object.values(evidence.verificationSection ?? {}).includes("failed");
-      const approvalPending =
-        evidence.reviewSection?.humanReview === "required" ||
-        evidence.reviewSection?.codeOwnerApproval === "pending";
-
-      return {
-        evidenceCount: acc.evidenceCount + 1,
-        failedVerificationCount: acc.failedVerificationCount + (verificationFailed ? 1 : 0),
-        approvalPendingCount: acc.approvalPendingCount + (approvalPending ? 1 : 0),
-        secret: acc.secret + scanCounts.secret,
-        sast: acc.sast + scanCounts.sast,
-        dependency: acc.dependency + scanCounts.dependency,
-        license: acc.license + scanCounts.license,
-      };
-    },
-    {
-      evidenceCount: 0,
-      failedVerificationCount: 0,
-      approvalPendingCount: 0,
-      secret: 0,
-      sast: 0,
-      dependency: 0,
-      license: 0,
-    },
-  );
-}
-
-function hasScanFindings(evidence: Evidence) {
-  const scanCounts = countScanFindings(evidence.verificationSection);
-  return scanCounts.secret + scanCounts.sast + scanCounts.dependency + scanCounts.license > 0;
-}
-
-function isApprovalPending(evidence: Evidence) {
-  return (
-    evidence.reviewSection?.humanReview === "required" ||
-    evidence.reviewSection?.codeOwnerApproval === "pending"
-  );
-}
+import {
+  getEvidenceExportBundle,
+  getEvidenceExportBundleUrl,
+  type EvidenceExportBundleResponse,
+} from "@/lib/api-client";
 
 const COMBINED_SCAN_MODES = [
   {
@@ -90,6 +28,22 @@ const COMBINED_SCAN_MODES = [
     tone: "red",
   },
 ] as const;
+
+function getScanFindingCount(summary: EvidenceExportBundleResponse["summary"], scanType: string) {
+  return summary.scanFindingTotals[scanType] ?? 0;
+}
+
+function getPreparationCount(summary: EvidenceExportBundleResponse["summary"], mode: string) {
+  return summary.preparationModeTotals[mode] ?? 0;
+}
+
+function getGovernanceCount(summary: EvidenceExportBundleResponse["summary"], actionType: string) {
+  return summary.governanceActionTotals[actionType] ?? 0;
+}
+
+function getDeliveryCount(summary: EvidenceExportBundleResponse["summary"], actionType: string) {
+  return summary.deliveryActionTotals[actionType] ?? 0;
+}
 
 const FILTERED_VIEW_LINKS = [
   {
@@ -118,17 +72,85 @@ const FILTERED_VIEW_LINKS = [
   },
 ] as const;
 
+const ACTION_TYPE_META = [
+  {
+    label: "Approvals",
+    actionTypes: ["task_approved"],
+    tone: "emerald",
+    description: "View approval actions recorded in the evidence trail.",
+  },
+  {
+    label: "Rejections",
+    actionTypes: ["task_rejected"],
+    tone: "amber",
+    description: "View rejection actions recorded in the evidence trail.",
+  },
+  {
+    label: "Stops",
+    actionTypes: ["run_stopped"],
+    tone: "rose",
+    description: "View operator stop actions recorded in the evidence trail.",
+  },
+  {
+    label: "Deliveries",
+    actionTypes: ["github_pull_request_created", "github_review_submitted", "github_release_dispatched"],
+    tone: "sky",
+    description: "View external GitHub-facing delivery actions across PRs, reviews, and releases.",
+  },
+] as const;
+
+function formatActivityActor(actor: Record<string, unknown> | null) {
+  if (!actor) {
+    return "Unknown actor";
+  }
+
+  const name = typeof actor.name === "string" ? actor.name : null;
+  const role = typeof actor.role === "string" ? actor.role : null;
+  const source = typeof actor.source === "string" ? actor.source : null;
+  const parts = [name, role, source].filter(Boolean);
+  return parts.length > 0 ? parts.join(" / ") : "Unknown actor";
+}
+
+function formatActivityLabel(type: string) {
+  return type.replaceAll("_", " ");
+}
+
 export default async function DashboardAuditExportPage() {
-  const evidences = await getEvidences();
-  const allPreview = buildExportPreview(evidences);
-  const findingsOnly = evidences.filter(hasScanFindings);
-  const findingsPreview = buildExportPreview(findingsOnly);
-  const approvalPendingOnly = evidences.filter(isApprovalPending);
-  const approvalPreview = buildExportPreview(approvalPendingOnly);
-  const findingsAndApprovalPending = evidences.filter(
-    (evidence) => hasScanFindings(evidence) && isApprovalPending(evidence),
-  );
-  const findingsAndApprovalPreview = buildExportPreview(findingsAndApprovalPending);
+  const [
+    allBundle,
+    findingsBundle,
+    approvalPendingBundle,
+    findingsAndApprovalBundle,
+    secretBundle,
+    sastBundle,
+    dependencyBundle,
+    licenseBundle,
+    secretDependencyBundle,
+    sastLicenseBundle,
+    allSecurityBundle,
+    approvalsBundle,
+    rejectionsBundle,
+    stopsBundle,
+    deliveriesBundle,
+  ] = await Promise.all([
+    getEvidenceExportBundle(),
+    getEvidenceExportBundle({ scanFindingsOnly: true }),
+    getEvidenceExportBundle({ approvalPendingOnly: true }),
+    getEvidenceExportBundle({ scanFindingsOnly: true, approvalPendingOnly: true }),
+    getEvidenceExportBundle({ scanTypes: ["secret_scan"] }),
+    getEvidenceExportBundle({ scanTypes: ["sast_scan"] }),
+    getEvidenceExportBundle({ scanTypes: ["dependency_scan"] }),
+    getEvidenceExportBundle({ scanTypes: ["license_scan"] }),
+    getEvidenceExportBundle({ scanTypes: ["secret_scan", "dependency_scan"] }),
+    getEvidenceExportBundle({ scanTypes: ["sast_scan", "license_scan"] }),
+    getEvidenceExportBundle({ scanTypes: ["secret_scan", "sast_scan", "dependency_scan"] }),
+    getEvidenceExportBundle({ actionTypes: ["task_approved"] }),
+    getEvidenceExportBundle({ actionTypes: ["task_rejected"] }),
+    getEvidenceExportBundle({ actionTypes: ["run_stopped"] }),
+    getEvidenceExportBundle({
+      actionTypes: ["github_pull_request_created", "github_review_submitted", "github_release_dispatched"],
+    }),
+  ]);
   const scanSpecificModes = [
     {
       title: "Secret Findings",
@@ -136,6 +158,7 @@ export default async function DashboardAuditExportPage() {
       scanType: "secret_scan",
       detailHref: "/dashboard/evidence?scanTypes=secret_scan",
       tone: "rose",
+      preview: secretBundle.summary,
     },
     {
       title: "SAST Findings",
@@ -143,6 +166,7 @@ export default async function DashboardAuditExportPage() {
       scanType: "sast_scan",
       detailHref: "/dashboard/evidence?scanTypes=sast_scan",
       tone: "orange",
+      preview: sastBundle.summary,
     },
     {
       title: "Dependency Findings",
@@ -150,6 +174,7 @@ export default async function DashboardAuditExportPage() {
       scanType: "dependency_scan",
       detailHref: "/dashboard/evidence?scanTypes=dependency_scan",
       tone: "amber",
+      preview: dependencyBundle.summary,
     },
     {
       title: "License Findings",
@@ -157,45 +182,36 @@ export default async function DashboardAuditExportPage() {
       scanType: "license_scan",
       detailHref: "/dashboard/evidence?scanTypes=license_scan",
       tone: "violet",
+      preview: licenseBundle.summary,
     },
-  ].map((mode) => {
-    const filtered = evidences.filter((evidence) => {
-      const scanCounts = countScanFindings(evidence.verificationSection);
-      const scanMap = {
-        secret_scan: scanCounts.secret,
-        sast_scan: scanCounts.sast,
-        dependency_scan: scanCounts.dependency,
-        license_scan: scanCounts.license,
-      };
-      return (scanMap[mode.scanType as keyof typeof scanMap] ?? 0) > 0;
-    });
-
-    return {
-      ...mode,
-      href: getEvidenceExportBundleUrl({ scanTypes: [mode.scanType] }),
-      buttonLabel: `Export ${mode.title}`,
-      preview: buildExportPreview(filtered),
-    };
-  });
-  const combinedScanModes = COMBINED_SCAN_MODES.map((mode) => {
-    const filtered = evidences.filter((evidence) => {
-      const scanCounts = countScanFindings(evidence.verificationSection);
-      const scanMap = {
-        secret_scan: scanCounts.secret,
-        sast_scan: scanCounts.sast,
-        dependency_scan: scanCounts.dependency,
-        license_scan: scanCounts.license,
-      };
-      return mode.scanTypes.some((scanType) => (scanMap[scanType as keyof typeof scanMap] ?? 0) > 0);
-    });
-
-    return {
-      ...mode,
-      href: getEvidenceExportBundleUrl({ scanTypes: [...mode.scanTypes] }),
-      buttonLabel: `Export ${mode.title}`,
-      preview: buildExportPreview(filtered),
-    };
-  });
+  ].map((mode) => ({
+    ...mode,
+    href: getEvidenceExportBundleUrl({ scanTypes: [mode.scanType] }),
+    buttonLabel: `Export ${mode.title}`,
+  }));
+  const combinedScanModes = COMBINED_SCAN_MODES.map((mode) => ({
+    ...mode,
+    href: getEvidenceExportBundleUrl({ scanTypes: [...mode.scanTypes] }),
+    buttonLabel: `Export ${mode.title}`,
+    preview:
+      mode.title === "Secret + Dependency"
+        ? secretDependencyBundle.summary
+        : mode.title === "SAST + License"
+          ? sastLicenseBundle.summary
+          : allSecurityBundle.summary,
+  }));
+  const actionModes = ACTION_TYPE_META.map((mode) => ({
+    ...mode,
+    href: getEvidenceExportBundleUrl({ actionTypes: [...mode.actionTypes] }),
+    preview:
+      mode.label === "Approvals"
+        ? approvalsBundle.summary
+        : mode.label === "Rejections"
+          ? rejectionsBundle.summary
+          : mode.label === "Stops"
+            ? stopsBundle.summary
+            : deliveriesBundle.summary,
+  }));
 
   const exportModes = [
     {
@@ -204,7 +220,7 @@ export default async function DashboardAuditExportPage() {
       href: getEvidenceExportBundleUrl(),
       detailHref: "/dashboard/evidence",
       buttonLabel: "Export Full",
-      preview: allPreview,
+      preview: allBundle.summary,
       tone: "emerald",
     },
     {
@@ -213,7 +229,7 @@ export default async function DashboardAuditExportPage() {
       href: getEvidenceExportBundleUrl({ scanFindingsOnly: true }),
       detailHref: "/dashboard/evidence?scanFindingsOnly=1",
       buttonLabel: "Export Findings",
-      preview: findingsPreview,
+      preview: findingsBundle.summary,
       tone: "rose",
     },
     {
@@ -222,7 +238,7 @@ export default async function DashboardAuditExportPage() {
       href: getEvidenceExportBundleUrl({ approvalPendingOnly: true }),
       detailHref: "/dashboard/evidence?approvalPendingOnly=1",
       buttonLabel: "Export Pending",
-      preview: approvalPreview,
+      preview: approvalPendingBundle.summary,
       tone: "amber",
     },
     {
@@ -231,7 +247,7 @@ export default async function DashboardAuditExportPage() {
       href: getEvidenceExportBundleUrl({ scanFindingsOnly: true, approvalPendingOnly: true }),
       detailHref: "/dashboard/evidence?scanFindingsOnly=1&approvalPendingOnly=1",
       buttonLabel: "Export Combined",
-      preview: findingsAndApprovalPreview,
+      preview: findingsAndApprovalBundle.summary,
       tone: "violet",
     },
   ] as const;
@@ -318,7 +334,19 @@ export default async function DashboardAuditExportPage() {
               <div className="rounded-md border border-gray-800 bg-gray-950 p-3 sm:col-span-2">
                 <p className="text-xs uppercase tracking-wide text-gray-500">Scan Findings</p>
                 <p className="mt-2 text-sm font-medium text-white">
-                  secret {mode.preview.secret} / sast {mode.preview.sast} / dependency {mode.preview.dependency} / license {mode.preview.license}
+                  secret {getScanFindingCount(mode.preview, "secret_scan")} / sast {getScanFindingCount(mode.preview, "sast_scan")} / dependency {getScanFindingCount(mode.preview, "dependency_scan")} / license {getScanFindingCount(mode.preview, "license_scan")}
+                </p>
+              </div>
+              <div className="rounded-md border border-gray-800 bg-gray-950 p-3 sm:col-span-2">
+                <p className="text-xs uppercase tracking-wide text-gray-500">Preparation Modes</p>
+                <p className="mt-2 text-sm font-medium text-white">
+                  worktree {getPreparationCount(mode.preview, "git_worktree")} / synthetic {getPreparationCount(mode.preview, "synthetic_git")} / snapshot {getPreparationCount(mode.preview, "snapshot_copy")} / direct {getPreparationCount(mode.preview, "direct")}
+                </p>
+              </div>
+              <div className="rounded-md border border-gray-800 bg-gray-950 p-3 sm:col-span-2">
+                <p className="text-xs uppercase tracking-wide text-gray-500">Governance Actions</p>
+                <p className="mt-2 text-sm font-medium text-white">
+                  approved {getGovernanceCount(mode.preview, "approved")} / rejected {getGovernanceCount(mode.preview, "rejected")} / stopped {getGovernanceCount(mode.preview, "stopped")} / PR {getDeliveryCount(mode.preview, "github_pull_request_created")} / review {getDeliveryCount(mode.preview, "github_review_submitted")} / release {getDeliveryCount(mode.preview, "github_release_dispatched")}
                 </p>
               </div>
             </div>
@@ -382,6 +410,18 @@ export default async function DashboardAuditExportPage() {
                 <div className="rounded-md border border-gray-800 bg-gray-950 p-3">
                   <p className="text-xs uppercase tracking-wide text-gray-500">Approval Pending</p>
                   <p className="mt-2 text-sm font-medium text-white">{mode.preview.approvalPendingCount}</p>
+                </div>
+                <div className="rounded-md border border-gray-800 bg-gray-950 p-3 sm:col-span-2">
+                  <p className="text-xs uppercase tracking-wide text-gray-500">Preparation Modes</p>
+                  <p className="mt-2 text-sm font-medium text-white">
+                    worktree {getPreparationCount(mode.preview, "git_worktree")} / synthetic {getPreparationCount(mode.preview, "synthetic_git")} / snapshot {getPreparationCount(mode.preview, "snapshot_copy")} / direct {getPreparationCount(mode.preview, "direct")}
+                  </p>
+                </div>
+                <div className="rounded-md border border-gray-800 bg-gray-950 p-3 sm:col-span-2">
+                  <p className="text-xs uppercase tracking-wide text-gray-500">Governance Actions</p>
+                  <p className="mt-2 text-sm font-medium text-white">
+                    approved {getGovernanceCount(mode.preview, "approved")} / rejected {getGovernanceCount(mode.preview, "rejected")} / stopped {getGovernanceCount(mode.preview, "stopped")} / PR {getDeliveryCount(mode.preview, "github_pull_request_created")} / review {getDeliveryCount(mode.preview, "github_review_submitted")} / release {getDeliveryCount(mode.preview, "github_release_dispatched")}
+                  </p>
                 </div>
               </div>
 
@@ -447,7 +487,19 @@ export default async function DashboardAuditExportPage() {
                 <div className="rounded-md border border-gray-800 bg-gray-950 p-3 sm:col-span-2">
                   <p className="text-xs uppercase tracking-wide text-gray-500">Scan Findings</p>
                   <p className="mt-2 text-sm font-medium text-white">
-                    secret {mode.preview.secret} / sast {mode.preview.sast} / dependency {mode.preview.dependency} / license {mode.preview.license}
+                    secret {getScanFindingCount(mode.preview, "secret_scan")} / sast {getScanFindingCount(mode.preview, "sast_scan")} / dependency {getScanFindingCount(mode.preview, "dependency_scan")} / license {getScanFindingCount(mode.preview, "license_scan")}
+                  </p>
+                </div>
+                <div className="rounded-md border border-gray-800 bg-gray-950 p-3 sm:col-span-2">
+                  <p className="text-xs uppercase tracking-wide text-gray-500">Preparation Modes</p>
+                  <p className="mt-2 text-sm font-medium text-white">
+                    worktree {getPreparationCount(mode.preview, "git_worktree")} / synthetic {getPreparationCount(mode.preview, "synthetic_git")} / snapshot {getPreparationCount(mode.preview, "snapshot_copy")} / direct {getPreparationCount(mode.preview, "direct")}
+                  </p>
+                </div>
+                <div className="rounded-md border border-gray-800 bg-gray-950 p-3 sm:col-span-2">
+                  <p className="text-xs uppercase tracking-wide text-gray-500">Governance Actions</p>
+                  <p className="mt-2 text-sm font-medium text-white">
+                    approved {getGovernanceCount(mode.preview, "approved")} / rejected {getGovernanceCount(mode.preview, "rejected")} / stopped {getGovernanceCount(mode.preview, "stopped")} / PR {getDeliveryCount(mode.preview, "github_pull_request_created")} / review {getDeliveryCount(mode.preview, "github_review_submitted")} / release {getDeliveryCount(mode.preview, "github_release_dispatched")}
                   </p>
                 </div>
               </div>
@@ -470,6 +522,150 @@ export default async function DashboardAuditExportPage() {
               </div>
             </section>
           ))}
+        </div>
+      </section>
+
+      <section className="space-y-4">
+        <div>
+          <h2 className="text-lg font-semibold text-white">Action-Type Exports</h2>
+          <p className="mt-1 text-sm text-gray-400">
+            Export governance and delivery evidence by action class instead of by scan lane.
+          </p>
+        </div>
+
+        <div className="grid gap-6 xl:grid-cols-2">
+          {actionModes.map((mode) => (
+            <section key={mode.label} className="rounded-lg border border-gray-800 bg-gray-900 p-5">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <h3 className="text-lg font-semibold text-white">{mode.label}</h3>
+                  <p className="mt-2 text-sm text-gray-400">{mode.description}</p>
+                </div>
+                <span
+                  className={
+                    mode.tone === "emerald"
+                      ? "rounded-full border border-emerald-900/50 bg-emerald-950/30 px-3 py-1 text-xs font-medium text-emerald-200"
+                      : mode.tone === "amber"
+                        ? "rounded-full border border-amber-900/50 bg-amber-950/30 px-3 py-1 text-xs font-medium text-amber-200"
+                        : mode.tone === "rose"
+                          ? "rounded-full border border-rose-900/50 bg-rose-950/30 px-3 py-1 text-xs font-medium text-rose-200"
+                          : "rounded-full border border-sky-900/50 bg-sky-950/30 px-3 py-1 text-xs font-medium text-sky-200"
+                  }
+                >
+                  {mode.preview.evidenceCount} evidence
+                </span>
+              </div>
+
+              <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                <div className="rounded-md border border-gray-800 bg-gray-950 p-3">
+                  <p className="text-xs uppercase tracking-wide text-gray-500">Failed Verification</p>
+                  <p className="mt-2 text-sm font-medium text-white">{mode.preview.failedVerificationCount}</p>
+                </div>
+                <div className="rounded-md border border-gray-800 bg-gray-950 p-3">
+                  <p className="text-xs uppercase tracking-wide text-gray-500">Approval Pending</p>
+                  <p className="mt-2 text-sm font-medium text-white">{mode.preview.approvalPendingCount}</p>
+                </div>
+                <div className="rounded-md border border-gray-800 bg-gray-950 p-3 sm:col-span-2">
+                  <p className="text-xs uppercase tracking-wide text-gray-500">Governance Actions</p>
+                  <p className="mt-2 text-sm font-medium text-white">
+                    approved {getGovernanceCount(mode.preview, "approved")} / rejected {getGovernanceCount(mode.preview, "rejected")} / stopped {getGovernanceCount(mode.preview, "stopped")}
+                  </p>
+                </div>
+                <div className="rounded-md border border-gray-800 bg-gray-950 p-3 sm:col-span-2">
+                  <p className="text-xs uppercase tracking-wide text-gray-500">Delivery Actions</p>
+                  <p className="mt-2 text-sm font-medium text-white">
+                    PR {getDeliveryCount(mode.preview, "github_pull_request_created")} / review {getDeliveryCount(mode.preview, "github_review_submitted")} / release {getDeliveryCount(mode.preview, "github_release_dispatched")} / sync {getDeliveryCount(mode.preview, "github_release_status_synced")}
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-5 flex flex-wrap gap-2">
+                <Link
+                  href={mode.href}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex rounded-md border border-gray-700 px-3 py-2 text-sm font-medium text-gray-200 transition hover:border-gray-600 hover:bg-gray-950"
+                >
+                  Export {mode.label}
+                </Link>
+                <Link
+                  href="/dashboard/evidence"
+                  className="inline-flex rounded-md border border-gray-700 px-3 py-2 text-sm font-medium text-gray-200 transition hover:border-gray-600 hover:bg-gray-950"
+                >
+                  View Evidence
+                </Link>
+              </div>
+            </section>
+          ))}
+        </div>
+      </section>
+
+      <section className="rounded-lg border border-gray-800 bg-gray-900 p-5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h2 className="text-lg font-semibold text-white">Recent Audit Activity</h2>
+            <p className="mt-1 text-sm text-gray-400">
+              Time-ordered governance and delivery actions extracted from evidence bundles.
+            </p>
+          </div>
+          <Link
+            href={getEvidenceExportBundleUrl()}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex rounded-md border border-gray-700 px-3 py-2 text-sm font-medium text-gray-200 transition hover:border-gray-600 hover:bg-gray-950"
+          >
+            Export Full Activity
+          </Link>
+        </div>
+
+        <div className="mt-5 space-y-3">
+          {allBundle.activity.length > 0 ? (
+            allBundle.activity.slice(0, 12).map((activity, index) => (
+              <div
+                key={`${activity.evidenceId}-${activity.type}-${activity.timestamp ?? index}`}
+                className="rounded-md border border-gray-800 bg-gray-950 p-4"
+              >
+                <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                  <div>
+                    <p className="text-xs uppercase tracking-wide text-gray-500">{formatActivityLabel(activity.type)}</p>
+                    <p className="mt-2 text-sm font-medium text-white">{activity.repo ?? "Unknown repo"}</p>
+                    <p className="mt-1 text-xs text-gray-400">
+                      Actor: {formatActivityActor(activity.actor)}{activity.runId ? ` · Run ${activity.runId.slice(0, 8)}` : ""}{activity.taskId ? ` · Task ${activity.taskId.slice(0, 8)}` : ""}
+                    </p>
+                  </div>
+                  <div className="text-left lg:text-right">
+                    <p className="text-xs text-gray-500">
+                      {activity.timestamp ? new Date(activity.timestamp).toLocaleString() : "No timestamp"}
+                    </p>
+                    <div className="mt-3 flex flex-wrap gap-2 lg:justify-end">
+                      {activity.runId ? (
+                        <Link
+                          href={`/dashboard/runs/${activity.runId}`}
+                          className="inline-flex rounded-md border border-gray-700 px-3 py-2 text-xs font-medium text-gray-200 transition hover:border-gray-600 hover:bg-gray-900"
+                        >
+                          Open Run
+                        </Link>
+                      ) : null}
+                      {activity.targetUrl ? (
+                        <Link
+                          href={activity.targetUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex rounded-md border border-sky-800 px-3 py-2 text-xs font-medium text-sky-200 transition hover:border-sky-700 hover:bg-sky-950/30"
+                        >
+                          Open Target
+                        </Link>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))
+          ) : (
+            <div className="rounded-md border border-dashed border-gray-800 bg-gray-950 p-4 text-sm text-gray-500">
+              No governance or delivery actions have been captured in evidence yet.
+            </div>
+          )}
         </div>
       </section>
     </div>

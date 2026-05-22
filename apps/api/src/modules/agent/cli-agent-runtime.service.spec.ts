@@ -1,4 +1,4 @@
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -27,6 +27,8 @@ describe('CliAgentRuntimeService', () => {
         sandboxDir: root,
         workingDirectory: root,
         filesystemMode: 'workspace_write',
+        allowedPaths: [],
+        forbiddenPaths: [],
         networkMode: 'disabled',
         networkDomains: [],
         command: process.execPath,
@@ -87,6 +89,8 @@ describe('CliAgentRuntimeService', () => {
         sandboxDir: sandboxRoot,
         workingDirectory: workspaceRoot,
         filesystemMode: 'workspace_write',
+        allowedPaths: [],
+        forbiddenPaths: [],
         networkMode: 'disabled',
         networkDomains: [],
         command: process.execPath,
@@ -109,6 +113,7 @@ describe('CliAgentRuntimeService', () => {
 
       expect(await readFile(join(workspaceRoot, 'tracked.txt'), 'utf8')).toBe('source only\n');
       expect(await readFile(join(sandboxRoot, 'tracked.txt'), 'utf8')).toBe('sandbox edit\n');
+      await expect(access(join(sandboxRoot, '.git'))).resolves.toBeUndefined();
 
       const diff = await service.collectDiff('run-2');
       expect(diff.files).toEqual(
@@ -120,6 +125,49 @@ describe('CliAgentRuntimeService', () => {
 
       await service.cleanup('run-2');
       await expect(access(sandboxRoot)).rejects.toThrow();
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+      await rm(sandboxRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('initializes a synthetic git baseline for non-git sandboxes', async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), 'aicp-runtime-synth-workspace-'));
+    const sandboxRoot = await mkdtemp(join(tmpdir(), 'aicp-runtime-synth-sandbox-'));
+
+    try {
+      await writeFile(join(workspaceRoot, 'tracked.txt'), 'before\n');
+
+      const plan: AgentRunPlan = {
+        runId: 'run-2b',
+        taskId: 'task-2b',
+        agentName: 'codex',
+        branch: 'ai/task-task-2b',
+        sandboxDir: sandboxRoot,
+        workingDirectory: workspaceRoot,
+        filesystemMode: 'workspace_write',
+        allowedPaths: [],
+        forbiddenPaths: [],
+        networkMode: 'disabled',
+        networkDomains: [],
+        command: process.execPath,
+        args: ['-e', "require('node:fs').writeFileSync('tracked.txt', 'after\\n');"],
+        env: {},
+        timeoutMs: 5_000,
+      };
+
+      const stream = await service.execute(plan, 'started');
+      for await (const _event of stream) {
+        // Drain until completion.
+      }
+
+      const status = execFileSync('git', ['status', '--porcelain'], {
+        cwd: sandboxRoot,
+        env: process.env,
+      }).toString();
+
+      expect(status).toContain('M tracked.txt');
+      expect(await readFile(join(workspaceRoot, 'tracked.txt'), 'utf8')).toBe('before\n');
     } finally {
       await rm(workspaceRoot, { recursive: true, force: true });
       await rm(sandboxRoot, { recursive: true, force: true });
@@ -156,6 +204,8 @@ describe('CliAgentRuntimeService', () => {
         sandboxDir: sandboxRoot,
         workingDirectory: workspaceRoot,
         filesystemMode: 'workspace_write',
+        allowedPaths: [],
+        forbiddenPaths: [],
         networkMode: 'disabled',
         networkDomains: [],
         command: process.execPath,
@@ -206,6 +256,8 @@ describe('CliAgentRuntimeService', () => {
         sandboxDir: root,
         workingDirectory: root,
         filesystemMode: 'workspace_write',
+        allowedPaths: [],
+        forbiddenPaths: [],
         networkMode: 'disabled',
         networkDomains: [],
         command: process.execPath,
@@ -263,6 +315,8 @@ describe('CliAgentRuntimeService', () => {
         sandboxDir: sandboxRoot,
         workingDirectory: workspaceRoot,
         filesystemMode: 'read_only',
+        allowedPaths: [],
+        forbiddenPaths: [],
         networkMode: 'disabled',
         networkDomains: [],
         command: process.execPath,
@@ -314,6 +368,8 @@ describe('CliAgentRuntimeService', () => {
         sandboxDir: root,
         workingDirectory: root,
         filesystemMode: 'workspace_write',
+        allowedPaths: [],
+        forbiddenPaths: [],
         networkMode: 'disabled',
         networkDomains: [],
         command: process.execPath,
@@ -362,6 +418,65 @@ describe('CliAgentRuntimeService', () => {
       });
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('restricts workspace_write to the allowed path scope', async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), 'aicp-runtime-allowlist-workspace-'));
+    const sandboxRoot = await mkdtemp(join(tmpdir(), 'aicp-runtime-allowlist-sandbox-'));
+
+    try {
+      await mkdir(join(workspaceRoot, 'apps/api/src'), { recursive: true });
+      await mkdir(join(workspaceRoot, 'docs'), { recursive: true });
+      await writeFile(join(workspaceRoot, 'apps/api/src/allowed.ts'), 'before\n');
+      await writeFile(join(workspaceRoot, 'docs/blocked.md'), 'blocked\n');
+
+      const plan: AgentRunPlan = {
+        runId: 'run-7',
+        taskId: 'task-7',
+        agentName: 'codex',
+        branch: 'ai/task-task-7',
+        sandboxDir: sandboxRoot,
+        workingDirectory: workspaceRoot,
+        filesystemMode: 'workspace_write',
+        allowedPaths: ['apps/api/src/**'],
+        forbiddenPaths: ['docs/**'],
+        networkMode: 'disabled',
+        networkDomains: [],
+        command: process.execPath,
+        args: [
+          '-e',
+          [
+            "const fs = require('node:fs');",
+            "fs.writeFileSync('apps/api/src/allowed.ts', 'after\\n');",
+            "try {",
+            "  fs.writeFileSync('docs/blocked.md', 'mutated\\n');",
+            "  process.exit(0);",
+            "} catch (error) {",
+            "  console.error(error && error.code ? error.code : String(error));",
+            "  process.exit(17);",
+            "}",
+          ].join(' '),
+        ],
+        env: {},
+        timeoutMs: 5_000,
+      };
+
+      const stream = await service.execute(plan, 'started');
+      for await (const _event of stream) {
+        // Drain until completion.
+      }
+
+      expect(await readFile(join(sandboxRoot, 'apps/api/src/allowed.ts'), 'utf8')).toBe('after\n');
+      expect(await readFile(join(sandboxRoot, 'docs/blocked.md'), 'utf8')).toBe('blocked\n');
+
+      const evidence = await service.collectEvidence('run-7');
+      expect(evidence.succeeded).toBe(false);
+      expect(evidence.exitCode).toBe(17);
+      await service.cleanup('run-7');
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+      await rm(sandboxRoot, { recursive: true, force: true });
     }
   });
 });

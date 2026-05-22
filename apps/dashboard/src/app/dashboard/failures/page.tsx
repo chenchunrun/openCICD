@@ -1,5 +1,32 @@
+import { revalidatePath } from "next/cache";
 import Link from "next/link";
-import { getEvidences, getReleaseGate, getRuns, getTasks } from "@/lib/api-client";
+import { redirect } from "next/navigation";
+import { rejectTask, getEvidences, getEvidenceExportBundle, getReleaseGate, getRuns, getTasks, canPerformRole } from "@/lib/api-client";
+import { rethrowIfRedirectError } from "@/lib/server-action";
+
+async function rejectTaskAction(formData: FormData) {
+  "use server";
+
+  try {
+    const taskId = formData.get("taskId");
+    const reason = formData.get("reason");
+    if (typeof taskId !== "string" || taskId.length === 0) {
+      throw new Error("taskId is required");
+    }
+    if (typeof reason !== "string" || reason.trim().length === 0) {
+      throw new Error("Rejection reason is required");
+    }
+
+    await rejectTask(taskId, reason.trim());
+    revalidatePath("/dashboard/failures");
+    revalidatePath("/dashboard/release");
+    redirect(`/dashboard/failures?notice=${encodeURIComponent(`task_rejected:${taskId}`)}`);
+  } catch (error) {
+    rethrowIfRedirectError(error);
+    const message = error instanceof Error ? error.message : "Task rejection failed";
+    redirect(`/dashboard/failures?error=${encodeURIComponent(message)}`);
+  }
+}
 
 function getErrorMessage(run: Awaited<ReturnType<typeof getRuns>>[number]) {
   const errorEvent = run.events?.find((event) => event.type === "error");
@@ -45,8 +72,41 @@ function getSecurityScanSummary(run: Awaited<ReturnType<typeof getRuns>>[number]
   };
 }
 
-export default async function DashboardFailuresPage() {
-  const [runs, evidences, tasks] = await Promise.all([getRuns(), getEvidences(), getTasks()]);
+function isGovernanceStopped(run: Awaited<ReturnType<typeof getRuns>>[number]) {
+  return run.events?.some((event) => event.type === "run_stopped") ?? false;
+}
+
+function formatActivityActor(actor: Record<string, unknown> | null) {
+  if (!actor) {
+    return "Unknown actor";
+  }
+
+  const name = typeof actor.name === "string" ? actor.name : null;
+  const role = typeof actor.role === "string" ? actor.role : null;
+  const source = typeof actor.source === "string" ? actor.source : null;
+  const parts = [name, role, source].filter(Boolean);
+  return parts.length > 0 ? parts.join(" / ") : "Unknown actor";
+}
+
+function formatActivityLabel(type: string) {
+  return type.replaceAll("_", " ");
+}
+
+export default async function DashboardFailuresPage({
+  searchParams,
+}: {
+  searchParams?: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  const resolvedSearchParams = searchParams ? await searchParams : undefined;
+  const noticeParam = typeof resolvedSearchParams?.notice === "string" ? resolvedSearchParams.notice : undefined;
+  const errorParam = typeof resolvedSearchParams?.error === "string" ? resolvedSearchParams.error : undefined;
+  const canReject = canPerformRole("releaser");
+  const [runs, evidences, tasks, governanceActivityBundle] = await Promise.all([
+    getRuns(),
+    getEvidences(),
+    getTasks(),
+    getEvidenceExportBundle({ actionTypes: ["task_rejected", "run_stopped"] }),
+  ]);
   const failedRuns = runs.filter((run) => run.status === "failed");
   const escalatedRuns = runs.filter((run) => Boolean(run.repairs?.[0]?.escalationReason));
   const securityBlockedRuns = runs.filter((run) => Boolean(getSecurityScanSummary(run)));
@@ -83,6 +143,35 @@ export default async function DashboardFailuresPage() {
         }),
     )
   ).filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
+  const governanceBlocks = (
+    await Promise.all(
+      tasks
+        .filter((task) => ["approved", "rejected", "stopped", "failed", "completed", "in_progress"].includes(task.status))
+        .slice(0, 12)
+        .map(async (task) => {
+          const relatedRun = runs.find((run) => run.taskId === task.id);
+          const gate = ["completed", "failed", "stopped", "in_progress"].includes(task.status)
+            ? await getReleaseGate(task.id)
+            : null;
+          const approvalBlocked = gate?.blockers.some((blocker) => blocker.includes("Human approval required")) ?? false;
+          const rejected = task.status === "rejected";
+          const stopped = relatedRun ? isGovernanceStopped(relatedRun) : false;
+
+          if (!approvalBlocked && !rejected && !stopped) {
+            return null;
+          }
+
+          return {
+            task,
+            run: relatedRun ?? null,
+            gate,
+            rejected,
+            stopped,
+            approvalBlocked,
+          };
+        }),
+    )
+  ).filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
 
   return (
     <div className="space-y-8">
@@ -92,6 +181,148 @@ export default async function DashboardFailuresPage() {
           Focused queue for runs that failed, repairs that escalated, and evidence still waiting on approval.
         </p>
       </div>
+
+      {noticeParam ? (
+        <div className="rounded-lg border border-emerald-800 bg-emerald-950/50 px-4 py-3 text-sm text-emerald-200">
+          {noticeParam.startsWith("task_rejected:")
+            ? `Rejection recorded for ${noticeParam.split(":")[1] ?? "task"}.`
+            : noticeParam}
+        </div>
+      ) : null}
+
+      {errorParam ? (
+        <div className="rounded-lg border border-red-900 bg-red-950/40 px-4 py-3 text-sm text-red-200">
+          {errorParam}
+        </div>
+      ) : null}
+
+      <section className="space-y-4">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">Governance Blocks</h2>
+          <span className="text-sm text-gray-500">{governanceBlocks.length}</span>
+        </div>
+        <div className="space-y-3">
+          {governanceBlocks.length > 0 ? (
+            governanceBlocks.map(({ task, run, gate, rejected, stopped, approvalBlocked }) => (
+              <div
+                key={task.id}
+                className="rounded-lg border border-slate-700 bg-slate-950/40 p-4"
+              >
+                <div className="flex items-start justify-between gap-4">
+                  <div className="min-w-0">
+                    <p className="text-sm text-slate-300">Task {task.id.slice(0, 8)}</p>
+                    <p className="mt-1 text-base font-semibold text-white">{task.goal}</p>
+                    <p className="mt-2 text-sm text-gray-300">
+                      {rejected ? "Rejected by human approval flow" : null}
+                      {rejected && (approvalBlocked || stopped) ? " · " : null}
+                      {approvalBlocked ? "Waiting on approval boundary" : null}
+                      {approvalBlocked && stopped ? " · " : null}
+                      {stopped ? "Stopped by operator" : null}
+                    </p>
+                    {gate?.blockers?.length ? (
+                      <p className="mt-3 line-clamp-2 text-sm text-slate-200">
+                        {gate.blockers.join(" · ")}
+                      </p>
+                    ) : null}
+                  </div>
+                  <div className="shrink-0 text-right">
+                    <p className="text-sm font-medium text-slate-300">{task.status}</p>
+                    <p className="mt-2 text-xs text-gray-500">Run: {run?.id?.slice(0, 8) ?? "none"}</p>
+                  </div>
+                </div>
+                <div className="mt-4 flex flex-wrap gap-3">
+                  <Link
+                    href={run ? `/dashboard/runs/${run.id}` : "/dashboard/release"}
+                    className="rounded-md border border-gray-700 px-3 py-2 text-xs font-medium text-gray-200 transition hover:border-gray-600 hover:bg-gray-900"
+                  >
+                    {run ? "Open Run" : "Open Release View"}
+                  </Link>
+                  <form action={rejectTaskAction} className="flex items-center gap-2">
+                    <input type="hidden" name="taskId" value={task.id} />
+                    <input
+                      type="text"
+                      name="reason"
+                      placeholder="Rejection reason"
+                      className="w-44 rounded-md border border-gray-700 bg-gray-950 px-3 py-2 text-xs text-gray-100 placeholder:text-gray-500"
+                    />
+                    <button
+                      type="submit"
+                      disabled={!canReject || rejected}
+                      className={
+                        canReject && !rejected
+                          ? "rounded-md border border-amber-800 px-3 py-2 text-xs font-medium text-amber-200 transition hover:border-amber-700 hover:bg-amber-950/30"
+                          : "rounded-md border border-gray-800 px-3 py-2 text-xs font-medium text-gray-500"
+                      }
+                    >
+                      {rejected ? "Task Rejected" : canReject ? "Reject Task" : "Releaser Role Required"}
+                    </button>
+                  </form>
+                </div>
+              </div>
+            ))
+          ) : (
+            <div className="rounded-lg border border-dashed border-gray-800 bg-gray-900/60 p-4 text-sm text-gray-500">
+              No governance blocks detected.
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section className="space-y-4">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">Recent Governance Actions</h2>
+          <span className="text-sm text-gray-500">{governanceActivityBundle.activity.length}</span>
+        </div>
+        <div className="space-y-3">
+          {governanceActivityBundle.activity.length > 0 ? (
+            governanceActivityBundle.activity.slice(0, 8).map((activity, index) => (
+              <div
+                key={`${activity.evidenceId}-${activity.type}-${activity.timestamp ?? index}`}
+                className="rounded-lg border border-slate-700 bg-slate-950/40 p-4"
+              >
+                <div className="flex items-start justify-between gap-4">
+                  <div className="min-w-0">
+                    <p className="text-sm text-slate-300">{formatActivityLabel(activity.type)}</p>
+                    <p className="mt-1 text-base font-semibold text-white">{activity.repo ?? "Unknown repo"}</p>
+                    <p className="mt-2 text-sm text-gray-300">
+                      Actor: {formatActivityActor(activity.actor)}
+                    </p>
+                  </div>
+                  <div className="shrink-0 text-right">
+                    <p className="text-xs text-gray-500">
+                      {activity.timestamp ? new Date(activity.timestamp).toLocaleString() : "No timestamp"}
+                    </p>
+                  </div>
+                </div>
+                <div className="mt-4 flex flex-wrap gap-3">
+                  {activity.runId ? (
+                    <Link
+                      href={`/dashboard/runs/${activity.runId}`}
+                      className="rounded-md border border-gray-700 px-3 py-2 text-xs font-medium text-gray-200 transition hover:border-gray-600 hover:bg-gray-900"
+                    >
+                      Open Run
+                    </Link>
+                  ) : null}
+                  {activity.targetUrl ? (
+                    <Link
+                      href={activity.targetUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="rounded-md border border-sky-800 px-3 py-2 text-xs font-medium text-sky-200 transition hover:border-sky-700 hover:bg-sky-950/30"
+                    >
+                      Open Target
+                    </Link>
+                  ) : null}
+                </div>
+              </div>
+            ))
+          ) : (
+            <div className="rounded-lg border border-dashed border-gray-800 bg-gray-900/60 p-4 text-sm text-gray-500">
+              No governance rejections or stop actions recorded.
+            </div>
+          )}
+        </div>
+      </section>
 
       <section className="space-y-4">
         <div className="flex items-center justify-between">

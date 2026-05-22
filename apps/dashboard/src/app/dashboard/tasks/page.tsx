@@ -1,6 +1,18 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { createTask, executeTask, getRepos, getRuns, getTasks, type Run } from "@/lib/api-client";
+import {
+  AICP_ACTOR_NAME,
+  AICP_ACTOR_ROLE,
+  approveTask,
+  canPerformRole,
+  createTask,
+  executeTask,
+  getRepos,
+  getRuns,
+  getTasks,
+  rejectTask,
+  type Run,
+} from "@/lib/api-client";
 import { rethrowIfRedirectError } from "@/lib/server-action";
 
 function parseMultiline(value: string | File | null): string[] {
@@ -25,6 +37,16 @@ function getNoticeContent(notice?: string, taskId?: string) {
       return {
         tone: "success" as const,
         message: `Task ${taskId ?? ""} was accepted and is now running in the background.`.trim(),
+      };
+    case "task_approved":
+      return {
+        tone: "success" as const,
+        message: `Approval recorded for task ${taskId ?? ""}.`.trim(),
+      };
+    case "task_rejected":
+      return {
+        tone: "info" as const,
+        message: `Rejection recorded for task ${taskId ?? ""}.`.trim(),
       };
     case "already_running":
       return {
@@ -118,6 +140,55 @@ async function runTaskAction(formData: FormData) {
   }
 }
 
+async function approveTaskAction(formData: FormData) {
+  "use server";
+
+  try {
+    const taskId = formData.get("taskId");
+    const reason = formData.get("reason");
+    if (typeof taskId !== "string" || taskId.length === 0) {
+      throw new Error("taskId is required");
+    }
+
+    await approveTask(taskId, typeof reason === "string" && reason.trim().length > 0 ? reason.trim() : undefined);
+    revalidatePath("/dashboard");
+    revalidatePath("/dashboard/tasks");
+    revalidatePath("/dashboard/failures");
+    revalidatePath("/dashboard/release");
+    redirect(`/dashboard/tasks?notice=task_approved&taskId=${encodeURIComponent(taskId)}`);
+  } catch (error) {
+    rethrowIfRedirectError(error);
+    const message = error instanceof Error ? error.message : "Task approval failed";
+    redirect(`/dashboard/tasks?error=${encodeURIComponent(message)}`);
+  }
+}
+
+async function rejectTaskAction(formData: FormData) {
+  "use server";
+
+  try {
+    const taskId = formData.get("taskId");
+    const reason = formData.get("reason");
+    if (typeof taskId !== "string" || taskId.length === 0) {
+      throw new Error("taskId is required");
+    }
+    if (typeof reason !== "string" || reason.trim().length === 0) {
+      throw new Error("Rejection reason is required");
+    }
+
+    await rejectTask(taskId, reason.trim());
+    revalidatePath("/dashboard");
+    revalidatePath("/dashboard/tasks");
+    revalidatePath("/dashboard/failures");
+    revalidatePath("/dashboard/release");
+    redirect(`/dashboard/tasks?notice=task_rejected&taskId=${encodeURIComponent(taskId)}`);
+  } catch (error) {
+    rethrowIfRedirectError(error);
+    const message = error instanceof Error ? error.message : "Task rejection failed";
+    redirect(`/dashboard/tasks?error=${encodeURIComponent(message)}`);
+  }
+}
+
 export default async function DashboardTasksPage({
   searchParams,
 }: {
@@ -130,6 +201,7 @@ export default async function DashboardTasksPage({
   const errorParam = typeof resolvedSearchParams?.error === "string" ? resolvedSearchParams.error : undefined;
   const notice = getNoticeContent(noticeParam, taskIdParam);
   const latestRunByTaskId = getLatestRunByTaskId(runs);
+  const canApproveOrReject = canPerformRole("releaser");
 
   return (
     <div className="space-y-6">
@@ -138,6 +210,12 @@ export default async function DashboardTasksPage({
         <p className="mt-1 text-sm text-gray-400">
           Review normalized tasks and trigger execution through the orchestrator.
         </p>
+      </div>
+
+      <div className="rounded-lg border border-gray-800 bg-gray-900 px-4 py-3 text-sm text-gray-300">
+        Actor: <span className="font-medium text-white">{AICP_ACTOR_NAME}</span> · role{" "}
+        <span className="font-medium text-white">{AICP_ACTOR_ROLE}</span>. Task approval and rejection require{" "}
+        <span className="font-medium text-amber-200">releaser</span> or higher.
       </div>
 
       {notice ? (
@@ -289,6 +367,10 @@ export default async function DashboardTasksPage({
                     className={
                       task.status === "failed"
                         ? "rounded-full border border-red-800 bg-red-950/40 px-2 py-1 text-xs font-medium text-red-200"
+                        : task.status === "rejected"
+                          ? "rounded-full border border-amber-800 bg-amber-950/40 px-2 py-1 text-xs font-medium text-amber-200"
+                          : task.status === "approved"
+                            ? "rounded-full border border-sky-800 bg-sky-950/40 px-2 py-1 text-xs font-medium text-sky-200"
                         : task.status === "completed"
                           ? "rounded-full border border-emerald-800 bg-emerald-950/40 px-2 py-1 text-xs font-medium text-emerald-200"
                           : "rounded-full border border-gray-700 bg-gray-950 px-2 py-1 text-xs font-medium text-gray-300"
@@ -321,20 +403,62 @@ export default async function DashboardTasksPage({
                     : "-"}
                 </td>
                 <td className="px-4 py-3">
-                  <form action={runTaskAction}>
-                    <input type="hidden" name="taskId" value={task.id} />
-                    <button
-                      type="submit"
-                      disabled={["queued", "in_progress"].includes(task.status)}
-                      className="rounded-md bg-white px-3 py-2 text-xs font-semibold text-gray-950 transition hover:bg-gray-200 disabled:cursor-not-allowed disabled:bg-gray-700 disabled:text-gray-300"
-                    >
-                      {["queued", "in_progress"].includes(task.status)
-                        ? "Running"
-                        : task.status === "failed"
-                          ? "Retry"
-                          : "Execute"}
-                    </button>
-                  </form>
+                  <div className="flex min-w-[220px] flex-col gap-2">
+                    <form action={runTaskAction}>
+                      <input type="hidden" name="taskId" value={task.id} />
+                      <button
+                        type="submit"
+                        disabled={["queued", "in_progress"].includes(task.status)}
+                        className="w-full rounded-md bg-white px-3 py-2 text-xs font-semibold text-gray-950 transition hover:bg-gray-200 disabled:cursor-not-allowed disabled:bg-gray-700 disabled:text-gray-300"
+                      >
+                        {["queued", "in_progress"].includes(task.status)
+                          ? "Running"
+                          : task.status === "failed"
+                            ? "Retry"
+                            : "Execute"}
+                      </button>
+                    </form>
+                    <form action={approveTaskAction} className="flex gap-2">
+                      <input type="hidden" name="taskId" value={task.id} />
+                      <input
+                        type="text"
+                        name="reason"
+                        placeholder="Approval note"
+                        className="min-w-0 flex-1 rounded-md border border-gray-700 bg-gray-950 px-2 py-2 text-xs text-white placeholder:text-gray-500"
+                      />
+                      <button
+                        type="submit"
+                        disabled={!canApproveOrReject || task.status === "approved"}
+                        className={
+                          canApproveOrReject && task.status !== "approved"
+                            ? "rounded-md border border-emerald-800 px-3 py-2 text-xs font-medium text-emerald-200 transition hover:border-emerald-700 hover:bg-emerald-950/30"
+                            : "rounded-md border border-gray-800 px-3 py-2 text-xs font-medium text-gray-500"
+                        }
+                      >
+                        {task.status === "approved" ? "Approved" : "Approve"}
+                      </button>
+                    </form>
+                    <form action={rejectTaskAction} className="flex gap-2">
+                      <input type="hidden" name="taskId" value={task.id} />
+                      <input
+                        type="text"
+                        name="reason"
+                        placeholder="Rejection reason"
+                        className="min-w-0 flex-1 rounded-md border border-gray-700 bg-gray-950 px-2 py-2 text-xs text-white placeholder:text-gray-500"
+                      />
+                      <button
+                        type="submit"
+                        disabled={!canApproveOrReject || task.status === "rejected"}
+                        className={
+                          canApproveOrReject && task.status !== "rejected"
+                            ? "rounded-md border border-amber-800 px-3 py-2 text-xs font-medium text-amber-200 transition hover:border-amber-700 hover:bg-amber-950/30"
+                            : "rounded-md border border-gray-800 px-3 py-2 text-xs font-medium text-gray-500"
+                        }
+                      >
+                        {task.status === "rejected" ? "Rejected" : "Reject"}
+                      </button>
+                    </form>
+                  </div>
                 </td>
               </tr>
             )})}
